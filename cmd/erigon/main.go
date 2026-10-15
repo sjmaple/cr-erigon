@@ -37,6 +37,7 @@ import (
 	"github.com/erigontech/erigon/diagnostics/syscheck"
 	"github.com/erigontech/erigon/eez"
 	eezconfig "github.com/erigontech/erigon/eez/config"
+	eezrpc "github.com/erigontech/erigon/eez/rpc"
 	"github.com/erigontech/erigon/execution/types"
 	erigoncli "github.com/erigontech/erigon/node/cli"
 	"github.com/erigontech/erigon/node/debug"
@@ -115,6 +116,11 @@ func runErigon(ctx context.Context, cliCtx *cli.Command) (err error) {
 	}
 
 	ethCfg := node.NewEthConfigUrfave(ctx, cliCtx, nodeCfg, logger)
+	var eezAPI *eezrpc.API
+	if eezCfg != nil {
+		eezAPI = eezrpc.NewAPI()
+		ethCfg.ExtraAPIs = append(ethCfg.ExtraAPIs, eezAPI.API())
+	}
 	if follows {
 		configureFollowerEth(ethCfg)
 	}
@@ -126,7 +132,7 @@ func runErigon(ctx context.Context, cliCtx *cli.Command) (err error) {
 	}
 	var followerSvc interface{ Err() error }
 	if follows {
-		if followerSvc, err = startFollower(ctx, ethNode, eezCfg, nodeCfg.Dirs, logger); err != nil {
+		if followerSvc, err = startFollower(ctx, ethNode, eezCfg, eezAPI, nodeCfg.Dirs, logger); err != nil {
 			ethNode.Close()
 			return err
 		}
