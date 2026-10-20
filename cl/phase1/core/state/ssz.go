@@ -32,12 +32,14 @@ func (b *CachingBeaconState) EncodeSSZ(buf []byte) ([]byte, error) {
 }
 
 func (b *CachingBeaconState) DecodeSSZ(buf []byte, version int) error {
+	b.publicKeyIndices = pubkeyIndex{}
 	if err := b.BeaconState.DecodeSSZ(buf, version); err != nil {
 		return err
 	}
 	sz := metrics.NewHistTimer("decode_ssz_beacon_state_size")
 	sz.Observe(float64(len(buf)))
-	return b.InitBeaconState()
+	b.publicKeyIndices = newDeferredPubkeyIndex(b.ValidatorSet().Length())
+	return b.reinitCaches()
 }
 
 // SSZ size of the Beacon State

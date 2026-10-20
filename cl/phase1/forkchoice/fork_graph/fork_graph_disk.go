@@ -167,6 +167,8 @@ type forkGraphDisk struct {
 
 // Initialize fork graph with a new state.
 func NewForkGraphDisk(anchorState *state.CachingBeaconState, syncedData synced_data.SyncedData, aferoFs afero.Fs, rcfg beacon_router_configuration.RouterConfiguration) (ForkGraph, error) {
+	// Build the shared pubkey index before fork-choice locking begins.
+	_, _ = anchorState.ValidatorIndexByPubkey([48]byte{})
 	farthestExtendingPath := make(map[common.Hash]bool)
 	anchorRoot, err := anchorState.BlockRoot()
 	if err != nil {
