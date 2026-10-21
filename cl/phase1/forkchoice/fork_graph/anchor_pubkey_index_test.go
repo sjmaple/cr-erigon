@@ -36,11 +36,21 @@ func TestNewForkGraphDiskWarmsAnchorPubkeyIndex(t *testing.T) {
 	coldBytes := pubkeyLookupAllocatedBytes(t, cold, key)
 	require.Greater(t, coldBytes, uint64(64<<10))
 
-	anchor, key := decodedAnchorWithValidators(t, 2_048)
-	_, err := NewForkGraphDisk(anchor, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{})
-	require.NoError(t, err)
+	for _, target := range []string{"anchor", "graph copy"} {
+		t.Run(target, func(t *testing.T) {
+			anchor, key := decodedAnchorWithValidators(t, 2_048)
+			graph, err := NewForkGraphDisk(anchor, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{})
+			require.NoError(t, err)
+			lookupState := anchor
+			if target == "graph copy" {
+				lookupState = graph.CurrentStateLocked(graph.AnchorRoot())
+				require.NotNil(t, lookupState)
+			}
 
-	require.Less(t, pubkeyLookupAllocatedBytes(t, anchor, key), coldBytes/4)
+			allocatedBytes := pubkeyLookupAllocatedBytes(t, lookupState, key)
+			require.Less(t, allocatedBytes, coldBytes/4)
+		})
+	}
 }
 
 func decodedAnchorWithValidators(t *testing.T, count int) (*state.CachingBeaconState, [48]byte) {

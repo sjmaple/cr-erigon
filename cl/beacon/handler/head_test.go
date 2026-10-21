@@ -167,45 +167,6 @@ func TestGetStateHeadReportsSyncing(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, statusCode)
 }
 
-func TestSelectedHeadStateUsesWinningSideBranch(t *testing.T) {
-	submittedRoot := common.Hash{0xaa}
-	selectedRoot := common.Hash{0xbb}
-	submittedState := state.New(&clparams.MainnetBeaconConfig)
-	selectedState := state.New(&clparams.MainnetBeaconConfig)
-	fcu := mock_services2.NewForkChoiceStorageMock(t)
-	fcu.HeadVal = selectedRoot
-	fcu.HeadSlotVal = 99
-	fcu.StateAtBlockRootVal[submittedRoot] = submittedState
-	fcu.StateAtBlockRootVal[selectedRoot] = selectedState
-	a := &ApiHandler{forkchoiceStore: fcu}
-
-	root, slot, headState, err := a.selectedHeadState(submittedRoot)
-	require.NoError(t, err)
-	require.Equal(t, selectedRoot, root)
-	require.Equal(t, uint64(99), slot)
-	require.Same(t, selectedState, headState)
-}
-
-func TestSelectedHeadStateReportsMissingAuxiliaryRoot(t *testing.T) {
-	auxiliaryRoot := common.Hash{0xaa}
-	a := &ApiHandler{forkchoiceStore: mock_services2.NewForkChoiceStorageMock(t)}
-
-	_, _, _, err := a.selectedHeadState(auxiliaryRoot)
-	require.EqualError(t, err, "failed to get auxiliary state for root 0xaa00000000000000000000000000000000000000000000000000000000000000")
-}
-
-func TestSelectedHeadStateReportsMissingSelectedRoot(t *testing.T) {
-	auxiliaryRoot := common.Hash{0xaa}
-	selectedRoot := common.Hash{0xbb}
-	fcu := mock_services2.NewForkChoiceStorageMock(t)
-	fcu.HeadVal = selectedRoot
-	fcu.StateAtBlockRootVal[auxiliaryRoot] = state.New(&clparams.MainnetBeaconConfig)
-	a := &ApiHandler{forkchoiceStore: fcu}
-
-	_, _, _, err := a.selectedHeadState(auxiliaryRoot)
-	require.EqualError(t, err, "failed to get selected head state for root 0xbb00000000000000000000000000000000000000000000000000000000000000")
-}
-
 func TestMemoizedExpectedWithdrawalsMatchesExplicitHeadRoot(t *testing.T) {
 	cfg := clparams.MainnetBeaconConfig
 	cfg.AltairForkEpoch = 0

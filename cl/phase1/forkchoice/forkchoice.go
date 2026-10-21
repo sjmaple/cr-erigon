@@ -18,6 +18,7 @@ package forkchoice
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -46,10 +47,13 @@ import (
 	"github.com/erigontech/erigon/cl/validator/validator_params"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/diagnostics/metrics"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/singleflight"
 )
+
+var currentStateCopy = metrics.GetOrCreateSummary("caplin_forkchoice_current_state_copy")
 
 // ForkNode is a struct that represents a node in the fork choice tree.
 type ForkNode struct {
@@ -828,23 +832,87 @@ func (f *ForkChoiceStore) AnchorExecutionPayloadBuilderIndex() (uint64, bool) {
 	return f.anchorExecutionPayloadBuilderIndex, f.anchorHasExecutionPayloadBid
 }
 
-func (f *ForkChoiceStore) GetStateAtBlockRoot(blockRoot common.Hash, alwaysCopy bool) (*state.CachingBeaconState, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.forkGraph.GetState(blockRoot, alwaysCopy)
+func (f *ForkChoiceStore) copyCurrentStateLocked(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, bool, error) {
+	current := f.forkGraph.CurrentStateLocked(blockRoot)
+	if current == nil {
+		return nil, false, nil
+	}
+	if dst == current {
+		return nil, true, errors.New("destination aliases fork graph current state")
+	}
+	start := time.Now()
+	defer currentStateCopy.ObserveDuration(start)
+	if dst == nil || dst.BeaconConfig() != current.BeaconConfig() {
+		copied, err := current.Copy()
+		return copied, true, err
+	}
+	return dst, true, current.CopyInto(dst)
+}
+
+func (f *ForkChoiceStore) copyStateAtBlockRoot(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+	var copied *state.CachingBeaconState
+	var current bool
+	var err error
+	func() {
+		f.mu.RLock()
+		defer f.mu.RUnlock()
+		copied, current, err = f.copyCurrentStateLocked(blockRoot, dst)
+	}()
+	if current || err != nil {
+		return copied, err
+	}
+	return f.forkGraph.ReplayState(blockRoot)
+}
+
+func (f *ForkChoiceStore) copyStateAtBlockRootLocked(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+	copied, current, err := f.copyCurrentStateLocked(blockRoot, dst)
+	if current || err != nil {
+		return copied, err
+	}
+	return f.forkGraph.ReplayState(blockRoot)
+}
+
+func (f *ForkChoiceStore) getStateLocked(blockRoot common.Hash) (*state.CachingBeaconState, error) {
+	if current := f.forkGraph.CurrentStateLocked(blockRoot); current != nil {
+		return current, nil
+	}
+	return f.forkGraph.ReplayState(blockRoot)
+}
+
+func (f *ForkChoiceStore) GetStateAtBlockRoot(blockRoot common.Hash) (*state.CachingBeaconState, error) {
+	return f.copyStateAtBlockRoot(blockRoot, nil)
+}
+
+func (f *ForkChoiceStore) CopyStateAtBlockRootInto(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+	return f.copyStateAtBlockRoot(blockRoot, dst)
 }
 
 func (f *ForkChoiceStore) ViewStateAtBlockRoot(blockRoot common.Hash, fn func(*state.CachingBeaconState) error) error {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	blockState, err := f.forkGraph.GetState(blockRoot, false)
+	found, err := f.viewStateAtBlockRoot(blockRoot, fn)
 	if err != nil {
 		return err
 	}
-	if blockState == nil {
+	if !found {
 		return fmt.Errorf("block state not found for root %v", blockRoot)
 	}
-	return fn(blockState)
+	return nil
+}
+
+func (f *ForkChoiceStore) viewStateAtBlockRoot(blockRoot common.Hash, fn func(*state.CachingBeaconState) error) (bool, error) {
+	f.mu.RLock()
+	if current := f.forkGraph.CurrentStateLocked(blockRoot); current != nil {
+		defer f.mu.RUnlock()
+		return true, fn(current)
+	}
+	f.mu.RUnlock()
+	blockState, err := f.forkGraph.ReplayState(blockRoot)
+	if err != nil {
+		return false, err
+	}
+	if blockState == nil {
+		return false, nil
+	}
+	return true, fn(blockState)
 }
 
 func (f *ForkChoiceStore) PreverifiedValidator(blockRoot common.Hash) uint64 {
@@ -1330,12 +1398,31 @@ func (f *ForkChoiceStore) ReadEnvelopeFromDisk(blockRoot common.Hash) (*cltypes.
 	return f.forkGraph.ReadEnvelopeFromDisk(blockRoot)
 }
 
+func viewStateCollection[T any](f *ForkChoiceStore, blockRoot common.Hash, copyCollection func(*state.CachingBeaconState) T) (T, error) {
+	var copied T
+	found, err := f.viewStateAtBlockRoot(blockRoot, func(st *state.CachingBeaconState) error {
+		copied = copyCollection(st)
+		return nil
+	})
+	if err != nil {
+		return copied, err
+	}
+	if !found {
+		return copied, fork_graph.ErrStateNotFound
+	}
+	return copied, nil
+}
+
 func (f *ForkChoiceStore) GetBalances(blockRoot common.Hash) (solid.Uint64ListSSZ, error) {
-	return f.forkGraph.GetBalances(blockRoot)
+	return viewStateCollection(f, blockRoot, func(st *state.CachingBeaconState) solid.Uint64ListSSZ {
+		return st.CopyBalances()
+	})
 }
 
 func (f *ForkChoiceStore) GetInactivitiesScores(blockRoot common.Hash) (solid.Uint64ListSSZ, error) {
-	return f.forkGraph.GetInactivitiesScores(blockRoot)
+	return viewStateCollection(f, blockRoot, func(st *state.CachingBeaconState) solid.Uint64ListSSZ {
+		return st.CopyInactivityScores()
+	})
 }
 
 func (f *ForkChoiceStore) GetPreviousParticipationIndicies(blockRoot common.Hash) (*solid.ParticipationBitList, error) {
@@ -1347,7 +1434,9 @@ func (f *ForkChoiceStore) GetPreviousParticipationIndicies(blockRoot common.Hash
 }
 
 func (f *ForkChoiceStore) GetValidatorSet(blockRoot common.Hash) (*solid.ValidatorSet, error) {
-	return f.forkGraph.GetValidatorSet(blockRoot)
+	return viewStateCollection(f, blockRoot, func(st *state.CachingBeaconState) *solid.ValidatorSet {
+		return st.CopyValidatorSet()
+	})
 }
 
 func (f *ForkChoiceStore) GetCurrentParticipationIndicies(blockRoot common.Hash) (*solid.ParticipationBitList, error) {

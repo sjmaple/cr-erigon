@@ -112,7 +112,7 @@ func (f *ForkChoiceStore) runOperationPruner() {
 		if !f.operationsPool.HasPrunableOperations() {
 			continue
 		}
-		finalizedState, err := f.forkGraph.GetState(checkpoint.Root, true)
+		finalizedState, err := f.copyStateAtBlockRoot(checkpoint.Root, nil)
 		if err != nil || finalizedState == nil {
 			log.Warn("Failed to load finalized state for operation pruning", "root", checkpoint.Root, "err", err)
 			continue
@@ -291,15 +291,72 @@ func (f *ForkChoiceStore) Ancestor(root common.Hash, slot uint64) ForkChoiceNode
 
 // getCheckpointState computes and caches checkpoint states.
 func (f *ForkChoiceStore) getCheckpointState(checkpoint solid.Checkpoint) (*checkpointState, error) {
-	// check if it can be found in cache.
-	if state, ok := f.checkpointStates.Load(checkpoint); ok {
-		return state.(*checkpointState), nil
+	if cached, ok := f.checkpointStates.Load(checkpoint); ok {
+		return cached.(*checkpointState), nil
 	}
-	cs, err, _ := f.checkpointStateBuilds.Do(fmt.Sprintf("%d:%x", checkpoint.Epoch, checkpoint.Root), func() (any, error) {
-		if state, ok := f.checkpointStates.Load(checkpoint); ok {
-			return state.(*checkpointState), nil
+	if f.forkGraph == nil {
+		return nil, errors.New("getCheckpointState: forkGraph not initialized")
+	}
+	var current bool
+	func() {
+		f.mu.RLock()
+		defer f.mu.RUnlock()
+		current = f.forkGraph.CurrentStateLocked(checkpoint.Root) != nil
+	}()
+	if current {
+		return f.getCheckpointStateFromCurrent(checkpoint)
+	}
+	return f.getCheckpointStateFromReplay(checkpoint)
+}
+
+func (f *ForkChoiceStore) getCheckpointStateLocked(checkpoint solid.Checkpoint) (*checkpointState, error) {
+	if cached, ok := f.checkpointStates.Load(checkpoint); ok {
+		return cached.(*checkpointState), nil
+	}
+	if f.forkGraph == nil {
+		return nil, errors.New("getCheckpointState: forkGraph not initialized")
+	}
+	baseState, current, err := f.copyCurrentStateLocked(checkpoint.Root, nil)
+	if err != nil {
+		return nil, err
+	}
+	if current {
+		return f.buildCheckpointState(checkpoint, baseState)
+	}
+	return f.getCheckpointStateFromReplay(checkpoint)
+}
+
+func (f *ForkChoiceStore) getCheckpointStateFromCurrent(checkpoint solid.Checkpoint) (*checkpointState, error) {
+	cs, err, _ := f.checkpointStateBuilds.Do(fmt.Sprintf("current:%d:%x", checkpoint.Epoch, checkpoint.Root), func() (any, error) {
+		if cached, ok := f.checkpointStates.Load(checkpoint); ok {
+			return cached.(*checkpointState), nil
 		}
-		return f.buildCheckpointState(checkpoint)
+		var baseState *state.CachingBeaconState
+		var cachedState *checkpointState
+		var current bool
+		var err error
+		func() {
+			f.mu.RLock()
+			defer f.mu.RUnlock()
+			if cached, ok := f.checkpointStates.Load(checkpoint); ok {
+				cachedState = cached.(*checkpointState)
+				return
+			}
+			baseState, current, err = f.copyCurrentStateLocked(checkpoint.Root, nil)
+		}()
+		if cachedState != nil {
+			return cachedState, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !current {
+			baseState, err = f.forkGraph.ReplayState(checkpoint.Root)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return f.buildCheckpointState(checkpoint, baseState)
 	})
 	if err != nil {
 		return nil, err
@@ -307,14 +364,24 @@ func (f *ForkChoiceStore) getCheckpointState(checkpoint solid.Checkpoint) (*chec
 	return cs.(*checkpointState), nil
 }
 
-func (f *ForkChoiceStore) buildCheckpointState(checkpoint solid.Checkpoint) (*checkpointState, error) {
-	if f.forkGraph == nil {
-		return nil, errors.New("getCheckpointState: forkGraph not initialized")
-	}
-	baseState, err := f.forkGraph.GetState(checkpoint.Root, true)
+func (f *ForkChoiceStore) getCheckpointStateFromReplay(checkpoint solid.Checkpoint) (*checkpointState, error) {
+	cs, err, _ := f.checkpointStateBuilds.Do(fmt.Sprintf("replay:%d:%x", checkpoint.Epoch, checkpoint.Root), func() (any, error) {
+		if cached, ok := f.checkpointStates.Load(checkpoint); ok {
+			return cached.(*checkpointState), nil
+		}
+		baseState, err := f.forkGraph.ReplayState(checkpoint.Root)
+		if err != nil {
+			return nil, err
+		}
+		return f.buildCheckpointState(checkpoint, baseState)
+	})
 	if err != nil {
 		return nil, err
 	}
+	return cs.(*checkpointState), nil
+}
+
+func (f *ForkChoiceStore) buildCheckpointState(checkpoint solid.Checkpoint, baseState *state.CachingBeaconState) (*checkpointState, error) {
 	if baseState == nil {
 		return nil, errors.New("getCheckpointState: baseState not found in graph")
 	}

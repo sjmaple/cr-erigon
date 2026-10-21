@@ -62,6 +62,8 @@ func (b *BeaconState) PrintLeaves() {
 }
 
 func (b *BeaconState) CurrentSyncCommitteeBranch() ([][32]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.computeDirtyLeaves(); err != nil {
 		return nil, err
 	}
@@ -92,6 +94,8 @@ func (b *BeaconState) CurrentSyncCommitteeBranch() ([][32]byte, error) {
 }
 
 func (b *BeaconState) NextSyncCommitteeBranch() ([][32]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.computeDirtyLeaves(); err != nil {
 		return nil, err
 	}
@@ -121,6 +125,8 @@ func (b *BeaconState) NextSyncCommitteeBranch() ([][32]byte, error) {
 }
 
 func (b *BeaconState) FinalityRootBranch() ([][32]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.computeDirtyLeaves(); err != nil {
 		return nil, err
 	}

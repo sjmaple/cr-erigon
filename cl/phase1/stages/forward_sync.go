@@ -125,7 +125,7 @@ func processDownloadedBlockBatches(ctx context.Context, logger log.Logger, cfg *
 			// Dump state periodically for restart checkpoints.
 			if !hasSignedHeaderInDB && block.Block.Slot%(cfg.beaconCfg.SlotsPerEpoch*2) == 0 {
 				var st *state.CachingBeaconState
-				st, err = cfg.forkChoice.GetStateAtBlockRoot(blockRoot, false)
+				st, err = cfg.forkChoice.GetStateAtBlockRoot(blockRoot)
 				if err == nil && st != nil {
 					if err = cfg.forkChoice.DumpBeaconStateOnDisk(st); err != nil {
 						err = fmt.Errorf("failed to dump state: %w", err)
@@ -143,7 +143,7 @@ func processDownloadedBlockBatches(ctx context.Context, logger log.Logger, cfg *
 		// Pre-GLOAS: dump state periodically for restart checkpoints.
 		if !hasSignedHeaderInDB && block.Block.Slot%(cfg.beaconCfg.SlotsPerEpoch*2) == 0 {
 			var st *state.CachingBeaconState
-			st, err = cfg.forkChoice.GetStateAtBlockRoot(blockRoot, false)
+			st, err = cfg.forkChoice.GetStateAtBlockRoot(blockRoot)
 			if err == nil && st != nil {
 				if err = cfg.forkChoice.DumpBeaconStateOnDisk(st); err != nil {
 					err = fmt.Errorf("failed to dump state: %w", err)
@@ -369,12 +369,12 @@ func setHeadStateFromForkChoice(cfg *Cfg, logger log.Logger) {
 	if err != nil {
 		return
 	}
-	headState, err := cfg.forkChoice.GetStateAtBlockRoot(headRoot, false)
-	if err != nil || headState == nil {
+	published, err := cfg.syncedData.OnHeadStateFrom(headRoot, cfg.forkChoice.CopyStateAtBlockRootInto)
+	if err != nil {
+		logger.Debug("Could not set head state from fork choice", "err", err)
 		return
 	}
-	if err := cfg.syncedData.OnHeadStateWithBlockRoot(headState, headRoot); err != nil {
-		logger.Debug("Could not set head state from fork choice", "err", err)
+	if !published {
 		return
 	}
 	logger.Info("[Caplin] Head state set from forward sync", "slot", headSlot, "root", headRoot)
@@ -417,7 +417,7 @@ func ensureAnchorEnvelopeOnce(ctx context.Context, cfg *Cfg) error {
 	// won't exist on the network and the timeout will expire harmlessly.
 	// We use the state's LatestExecutionPayloadBid (not the block) since the anchor
 	// block is not stored in the fork graph under the single-state model.
-	anchorState, err := cfg.forkChoice.GetStateAtBlockRoot(anchorRoot, true)
+	anchorState, err := cfg.forkChoice.GetStateAtBlockRoot(anchorRoot)
 	if err != nil || anchorState == nil {
 		log.Debug("[ensureAnchorEnvelopeOnce] anchor state not available, skipping", "err", err)
 		return nil

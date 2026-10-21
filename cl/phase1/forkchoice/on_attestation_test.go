@@ -19,6 +19,7 @@ package forkchoice
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -169,6 +170,57 @@ func TestOnAttestationUsesTargetShuffling(t *testing.T) {
 				require.Empty(t, graph.stateRoots())
 			}
 		})
+	}
+}
+
+func TestOnAttestationCurrentCheckpointStateDoesNotRelock(t *testing.T) {
+	fixture := newTargetShufflingFixture(t)
+	graph := fixture.forkGraph(false)
+	graph.states[fixture.targetRoot] = fixture.targetState
+	graph.currentStateRoot = fixture.targetRoot
+	graph.currentStateStarted = make(chan struct{}, 1)
+	graph.currentStateRelease = make(chan struct{})
+	store := newAttestationTestStore(t, fixture.cfg, fixture.headState, fixture.headRoot, fixture.attestationSlot, graph)
+	store.syncedDataManager = synced_data.NewSyncedDataManager(fixture.cfg, true)
+	target := solid.Checkpoint{Epoch: fixture.targetEpoch, Root: fixture.targetRoot}
+	store.checkpointStates.Delete(target)
+	attestation := &solid.Attestation{
+		AggregationBits: aggregationBits(fixture.committeeSize(t, fixture.targetRoot), int(fixture.cfg.MaxValidatorsPerCommittee), fixture.committeePosition),
+		Data: &solid.AttestationData{
+			Slot:            fixture.attestationSlot,
+			CommitteeIndex:  fixture.committeeIndex,
+			BeaconBlockRoot: fixture.targetRoot,
+			Target:          target,
+		},
+	}
+
+	attestationDone := make(chan error, 1)
+	go func() {
+		attestationDone <- store.OnAttestation(attestation, true, false)
+	}()
+	select {
+	case <-graph.currentStateStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attestation did not request the current checkpoint state")
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		store.mu.Lock()
+		close(writerDone)
+		store.mu.Unlock()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(graph.currentStateRelease)
+	select {
+	case err := <-attestationDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("attestation tried to reacquire the fork-choice lock")
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued writer did not complete")
 	}
 }
 

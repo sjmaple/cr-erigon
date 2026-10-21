@@ -25,6 +25,9 @@ import (
 )
 
 func (b *BeaconState) CopyInto(dst *BeaconState) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	dst.version = b.version
 	dst.genesisTime = b.genesisTime
 	dst.genesisValidatorsRoot = b.genesisValidatorsRoot
@@ -131,4 +134,28 @@ func (b *BeaconState) CopyInto(dst *BeaconState) error {
 func (b *BeaconState) Copy() (*BeaconState, error) {
 	copied := New(b.BeaconConfig())
 	return copied, b.CopyInto(copied)
+}
+
+func (b *BeaconState) CopyBalances() solid.Uint64ListSSZ {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	balances := solid.NewUint64ListSSZ(b.balances.Cap())
+	b.balances.CopyTo(balances)
+	return balances
+}
+
+func (b *BeaconState) CopyInactivityScores() solid.Uint64ListSSZ {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	scores := solid.NewUint64ListSSZ(b.inactivityScores.Cap())
+	b.inactivityScores.CopyTo(scores)
+	return scores
+}
+
+func (b *BeaconState) CopyValidatorSet() *solid.ValidatorSet {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	validators := solid.NewValidatorSet(b.validators.Cap())
+	b.validators.CopyTo(validators)
+	return validators
 }

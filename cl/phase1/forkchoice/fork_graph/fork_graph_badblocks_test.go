@@ -47,7 +47,7 @@ func TestForkGraphPrunesBelowAnchorBadBlocks(t *testing.T) {
 		block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.Phase0Version)
 		block.Block.Slot = anchorState.Slot()
 		block.Block.ProposerIndex = i
-		_, status, err := graph.AddChainSegment(block, false)
+		status, err := graph.AddChainSegment(block, false)
 		require.NoError(t, err)
 		require.Equal(t, BelowAnchor, status)
 	}
@@ -90,12 +90,12 @@ func TestForkGraphPrunesInvalidBlockBadBlocks(t *testing.T) {
 	require.NoError(t, err)
 	disk := graph.(*forkGraphDisk)
 
-	_, status, err := graph.AddChainSegment(blockA, true)
+	status, err := graph.AddChainSegment(blockA, true)
 	require.NoError(t, err)
 	require.Equal(t, Success, status)
 
 	blockC.Block.ProposerIndex = 81214459 // fails the transition, so the block is invalid
-	_, status, _ = graph.AddChainSegment(blockC, true)
+	status, _ = graph.AddChainSegment(blockC, true)
 	require.Equal(t, InvalidBlock, status)
 	require.Equal(t, 1, countSyncMap(&disk.badBlocks))
 

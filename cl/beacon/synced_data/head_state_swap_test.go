@@ -18,6 +18,7 @@ package synced_data
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,157 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state/raw"
 	"github.com/erigontech/erigon/common"
 )
+
+func TestOnHeadStateFromPublishesFilledSpare(t *testing.T) {
+	manager := NewSyncedDataManager(&clparams.MainnetBeaconConfig, true)
+	for i := range 3 {
+		require.NoError(t, manager.OnHeadStateWithBlockRoot(bigValidatorState(t, 1), common.Hash{byte(i + 1)}))
+	}
+
+	wantRoot := common.Hash{0x04}
+	wantSlot := uint64(44)
+	var filled *state.CachingBeaconState
+	published, err := manager.OnHeadStateFrom(wantRoot, func(root common.Hash, spare *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+		require.Equal(t, wantRoot, root)
+		require.NotNil(t, spare)
+		filled = spare
+		require.NoError(t, filled.SetSlot(wantSlot))
+		return filled, nil
+	})
+
+	require.NoError(t, err)
+	require.True(t, published)
+	require.NoError(t, manager.ViewHeadStateWithIdentity(func(head *state.CachingBeaconState, root common.Hash, slot uint64) error {
+		require.Same(t, filled, head)
+		require.Equal(t, wantRoot, root)
+		require.Equal(t, wantSlot, slot)
+		return nil
+	}))
+}
+
+func TestOnHeadStateFromKeepsHeadOnFailure(t *testing.T) {
+	seedManager := func(t *testing.T) (*SyncedDataManager, common.Hash) {
+		t.Helper()
+		manager := NewSyncedDataManager(&clparams.MainnetBeaconConfig, true)
+		var root common.Hash
+		for i := range 3 {
+			root = common.Hash{byte(i + 1)}
+			require.NoError(t, manager.OnHeadStateWithBlockRoot(bigValidatorState(t, 1), root))
+		}
+		return manager, root
+	}
+
+	t.Run("error discards spare", func(t *testing.T) {
+		manager, wantRoot := seedManager(t)
+		wantErr := errors.New("copy failed")
+		published, err := manager.OnHeadStateFrom(common.Hash{0x04}, func(_ common.Hash, spare *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			require.NotNil(t, spare)
+			return nil, wantErr
+		})
+		require.False(t, published)
+		require.ErrorIs(t, err, wantErr)
+		require.Equal(t, wantRoot, manager.HeadRoot())
+
+		published, err = manager.OnHeadStateFrom(common.Hash{0x05}, func(_ common.Hash, spare *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			require.Nil(t, spare)
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.False(t, published)
+	})
+
+	t.Run("nil result keeps spare", func(t *testing.T) {
+		manager, wantRoot := seedManager(t)
+		var retained *state.CachingBeaconState
+		published, err := manager.OnHeadStateFrom(common.Hash{0x04}, func(_ common.Hash, spare *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			require.NotNil(t, spare)
+			retained = spare
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.False(t, published)
+		require.Equal(t, wantRoot, manager.HeadRoot())
+
+		published, err = manager.OnHeadStateFrom(common.Hash{0x05}, func(_ common.Hash, spare *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			require.Same(t, retained, spare)
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.False(t, published)
+	})
+}
+
+func TestOnHeadStateFromDoesNotHoldReadLockDuringFill(t *testing.T) {
+	manager := NewSyncedDataManager(&clparams.MainnetBeaconConfig, true)
+	require.NoError(t, manager.OnHeadStateWithBlockRoot(bigValidatorState(t, 1), common.Hash{0x01}))
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	filled := bigValidatorState(t, 1)
+	go func() {
+		_, err := manager.OnHeadStateFrom(common.Hash{0x02}, func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			close(entered)
+			<-release
+			return filled, nil
+		})
+		done <- err
+	}()
+	<-entered
+
+	readDone := make(chan error, 1)
+	go func() {
+		readDone <- manager.ViewHeadState(func(*state.CachingBeaconState) error { return nil })
+	}()
+	select {
+	case err := <-readDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("head-state view blocked during fill")
+	}
+	close(release)
+	require.NoError(t, <-done)
+}
+
+func TestOnHeadStateFromSerializesPublishers(t *testing.T) {
+	manager := NewSyncedDataManager(&clparams.MainnetBeaconConfig, true)
+	require.NoError(t, manager.OnHeadStateWithBlockRoot(bigValidatorState(t, 1), common.Hash{0x00}))
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	firstState := bigValidatorState(t, 1)
+	require.NoError(t, firstState.SetSlot(1))
+	go func() {
+		_, err := manager.OnHeadStateFrom(common.Hash{0x01}, func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			close(firstEntered)
+			<-releaseFirst
+			return firstState, nil
+		})
+		firstDone <- err
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	secondState := bigValidatorState(t, 1)
+	require.NoError(t, secondState.SetSlot(2))
+	go func() {
+		_, err := manager.OnHeadStateFrom(common.Hash{0x02}, func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+			close(secondEntered)
+			return secondState, nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second publisher entered before first publisher completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+	require.Equal(t, common.Hash{0x02}, manager.HeadRoot())
+}
 
 // bigValidatorState builds a state with n validators, large enough to make
 // CachingBeaconState.Copy take tens of milliseconds.

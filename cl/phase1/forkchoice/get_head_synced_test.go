@@ -18,6 +18,7 @@ package forkchoice
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"sync/atomic"
 	"testing"
@@ -30,6 +31,8 @@ import (
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/cltypes"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/fork_graph"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/public_keys_registry"
@@ -57,6 +60,146 @@ func TestGetHeadWithSyncedHeadStateMatchesAuxiliaryStateHead(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, wantRoot, gotRoot)
 	require.Equal(t, wantSlot, gotSlot)
+}
+
+func TestGetHeadWithAuxiliaryRootMatchesAuxiliaryStateHead(t *testing.T) {
+	for _, tick := range []uint64{36 * 1000, clparams.MainnetBeaconConfig.SlotsPerEpoch * 12 * 1000} {
+		t.Run(fmt.Sprintf("tick_%d", tick), func(t *testing.T) {
+			wantStore, wantBlock := buildExAnteStorePendingLast(t, nil)
+			gotStore, gotBlock := buildExAnteStorePendingLast(t, nil)
+			gotSyncedRoot := gotStore.HighestSeenRoot()
+			gotSyncedState, err := gotStore.GetStateAtBlockRoot(gotSyncedRoot)
+			require.NoError(t, err)
+			require.NoError(t, gotStore.syncedDataManager.OnHeadStateWithBlockRoot(gotSyncedState, gotSyncedRoot))
+			wantStore.OnTick(tick)
+			gotStore.OnTick(tick)
+			require.NoError(t, wantStore.OnBlock(t.Context(), wantBlock, false, true, false))
+			require.NoError(t, gotStore.OnBlock(t.Context(), gotBlock, false, true, false))
+			auxiliaryRoot, err := gotBlock.Block.HashSSZ()
+			require.NoError(t, err)
+			wantAuxiliaryState, err := wantStore.GetStateAtBlockRoot(auxiliaryRoot)
+			require.NoError(t, err)
+
+			wantRoot, wantSlot, err := wantStore.GetHead(wantAuxiliaryState)
+			require.NoError(t, err)
+			gotRoot, gotSlot, err := gotStore.GetHeadWithAuxiliaryRoot(auxiliaryRoot)
+			require.NoError(t, err)
+			require.Equal(t, wantRoot, gotRoot)
+			require.Equal(t, wantSlot, gotSlot)
+		})
+	}
+}
+
+type recordingAuxiliaryStateForkGraph struct {
+	fork_graph.ForkGraph
+	root     common.Hash
+	replayed *state.CachingBeaconState
+	calls    atomic.Int32
+}
+
+func (g *recordingAuxiliaryStateForkGraph) ReplayState(root common.Hash) (*state.CachingBeaconState, error) {
+	if root == g.root {
+		g.calls.Add(1)
+		return g.replayed, nil
+	}
+	return g.ForkGraph.ReplayState(root)
+}
+
+func TestGetHeadWithAuxiliaryRootReplaysWhenRootIsNotCurrent(t *testing.T) {
+	store, baseGraph := newHeadSnapshotTestStore()
+	store.beaconCfg.GloasForkEpoch = 100
+	store.beaconCfg.InitializeForkSchedule()
+	store.publicKeysRegistry = public_keys_registry.NewInMemoryPublicKeysRegistry()
+	checkpoint := solid.Checkpoint{Epoch: 1, Root: common.Hash{0xaa}}
+	store.justifiedCheckpoint.Store(checkpoint)
+	baseGraph.currentJustified = checkpoint
+
+	checkpointState := state.New(store.beaconCfg)
+	require.NoError(t, checkpointState.SetSlot(store.beaconCfg.SlotsPerEpoch))
+	auxiliaryState := state.New(store.beaconCfg)
+	require.NoError(t, auxiliaryState.SetSlot(2*store.beaconCfg.SlotsPerEpoch))
+	const effectiveBalance = uint64(32_000_000_000)
+	for i := range 80 {
+		validator := solid.NewValidator()
+		validator.SetPublicKey([48]byte{byte(i + 1)})
+		validator.SetActivationEpoch(0)
+		validator.SetExitEpoch(store.beaconCfg.FarFutureEpoch)
+		validator.SetEffectiveBalance(effectiveBalance)
+		require.NoError(t, checkpointState.AddValidator(validator, effectiveBalance))
+		if i == 0 {
+			validator.SetEffectiveBalance(2 * effectiveBalance)
+			require.NoError(t, auxiliaryState.AddValidator(validator, 2*effectiveBalance))
+		} else {
+			require.NoError(t, auxiliaryState.AddValidator(validator, effectiveBalance))
+		}
+	}
+	baseGraph.states = map[common.Hash]*state.CachingBeaconState{checkpoint.Root: checkpointState}
+
+	boostedRoot := common.Hash{0x02}
+	nonBoostedRoot := common.Hash{0x01}
+	for _, root := range []common.Hash{boostedRoot, nonBoostedRoot} {
+		block := cltypes.NewSignedBeaconBlock(store.beaconCfg, clparams.DenebVersion)
+		block.Block.Slot = 2 * store.beaconCfg.SlotsPerEpoch
+		block.Block.ParentRoot = checkpoint.Root
+		baseGraph.headers[root] = block.SignedBeaconBlockHeader().Header
+		baseGraph.blocks[root] = block
+		store.updateChildren(11, checkpoint.Root, root)
+	}
+	store.headSet = map[common.Hash]struct{}{boostedRoot: {}, nonBoostedRoot: {}}
+	store.proposerBoostRoot.Store(boostedRoot)
+	store.setLatestMessage(0, LatestMessage{Slot: 2 * store.beaconCfg.SlotsPerEpoch, Root: nonBoostedRoot})
+	store.timeMs.Store(2 * store.beaconCfg.SlotsPerEpoch * store.beaconCfg.SecondsPerSlot * 1000)
+	store.checkpointStates.Delete(checkpoint)
+
+	fallbackRoot, _, err := store.GetHead(nil)
+	require.NoError(t, err)
+	require.Equal(t, boostedRoot, fallbackRoot)
+	store.headHash = common.Hash{}
+	auxiliaryRoot := common.Hash{0xbb}
+	graph := &recordingAuxiliaryStateForkGraph{ForkGraph: store.forkGraph, root: auxiliaryRoot, replayed: auxiliaryState}
+	store.forkGraph = graph
+
+	gotRoot, _, err := store.GetHeadWithAuxiliaryRoot(auxiliaryRoot)
+	require.NoError(t, err)
+	require.Equal(t, nonBoostedRoot, gotRoot)
+	require.NotEqual(t, fallbackRoot, gotRoot)
+	require.Equal(t, int32(1), graph.calls.Load())
+}
+
+type unavailableAuxiliaryStateForkGraph struct {
+	fork_graph.ForkGraph
+	root common.Hash
+	err  error
+}
+
+func (g *unavailableAuxiliaryStateForkGraph) ReplayState(root common.Hash) (*state.CachingBeaconState, error) {
+	if root == g.root {
+		return nil, g.err
+	}
+	return g.ForkGraph.ReplayState(root)
+}
+
+func TestGetHeadWithAuxiliaryRootReturnsErrorWhenReplayUnavailable(t *testing.T) {
+	gotStore, gotBlock := buildExAnteStorePendingLast(t, nil)
+	oldRoot := gotBlock.Block.ParentRoot
+	require.NoError(t, gotStore.OnBlock(t.Context(), gotBlock, false, true, false))
+	gotStore.forkGraph = &unavailableAuxiliaryStateForkGraph{ForkGraph: gotStore.forkGraph, root: oldRoot}
+	gotStore.headHash = gotStore.HighestSeenRoot()
+
+	_, _, err := gotStore.GetHeadWithAuxiliaryRoot(oldRoot)
+	require.ErrorContains(t, err, fmt.Sprintf("failed to get auxiliary state for root %x", oldRoot))
+}
+
+func TestGetHeadWithAuxiliaryRootPropagatesReplayError(t *testing.T) {
+	gotStore, gotBlock := buildExAnteStorePendingLast(t, nil)
+	oldRoot := gotBlock.Block.ParentRoot
+	require.NoError(t, gotStore.OnBlock(t.Context(), gotBlock, false, true, false))
+	replayErr := errors.New("replay failed")
+	gotStore.forkGraph = &unavailableAuxiliaryStateForkGraph{ForkGraph: gotStore.forkGraph, root: oldRoot, err: replayErr}
+	gotStore.headHash = gotStore.HighestSeenRoot()
+
+	_, _, err := gotStore.GetHeadWithAuxiliaryRoot(oldRoot)
+	require.ErrorIs(t, err, replayErr)
 }
 
 func TestGetHeadWithSyncedHeadStateDoesNotChangeCacheWhenNotSynced(t *testing.T) {
@@ -175,13 +318,17 @@ type pausingCheckpointStateForkGraph struct {
 	release chan struct{}
 }
 
-func (g *pausingCheckpointStateForkGraph) GetState(root common.Hash, alwaysCopy bool) (*state.CachingBeaconState, error) {
+func (g *pausingCheckpointStateForkGraph) CurrentStateLocked(common.Hash) *state.CachingBeaconState {
+	return nil
+}
+
+func (g *pausingCheckpointStateForkGraph) ReplayState(root common.Hash) (*state.CachingBeaconState, error) {
 	select {
 	case g.entered <- struct{}{}:
 	default:
 	}
 	<-g.release
-	return g.ForkGraph.GetState(root, alwaysCopy)
+	return g.ForkGraph.ReplayState(root)
 }
 
 type failingCheckpointStateForkGraph struct {
@@ -189,7 +336,11 @@ type failingCheckpointStateForkGraph struct {
 	calls atomic.Int32
 }
 
-func (g *failingCheckpointStateForkGraph) GetState(common.Hash, bool) (*state.CachingBeaconState, error) {
+func (g *failingCheckpointStateForkGraph) CurrentStateLocked(common.Hash) *state.CachingBeaconState {
+	return nil
+}
+
+func (g *failingCheckpointStateForkGraph) ReplayState(common.Hash) (*state.CachingBeaconState, error) {
 	g.calls.Add(1)
 	return nil, errors.New("checkpoint state unavailable")
 }

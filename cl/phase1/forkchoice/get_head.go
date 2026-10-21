@@ -19,6 +19,7 @@ package forkchoice
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand"
 	"slices"
 	"time"
@@ -33,6 +34,8 @@ import (
 )
 
 type auxiliaryStateView func(synced_data.ViewHeadStateFn) error
+
+var errAuxiliaryStateNotCurrent = errors.New("auxiliary state is not current")
 
 // accountWeights updates the weights of the validators, given the vote and given an head leaf.
 func (f *ForkChoiceStore) accountWeights(votes, weights map[common.Hash]uint64, justifedRoot, leaf common.Hash) {
@@ -124,6 +127,43 @@ func (f *ForkChoiceStore) GetHead(auxilliaryState *state.CachingBeaconState) (co
 	}
 	head, slot, err := f.getHeadNode(viewAuxiliaryState)
 	return head.Root, slot, err
+}
+
+func (f *ForkChoiceStore) GetHeadWithAuxiliaryRoot(root common.Hash) (common.Hash, uint64, error) {
+	var current bool
+	func() {
+		f.mu.RLock()
+		defer f.mu.RUnlock()
+		current = f.forkGraph.CurrentStateLocked(root) != nil
+	}()
+	if !current {
+		head, slot, err := f.getHeadWithReplayedAuxiliaryRoot(root)
+		return head.Root, slot, err
+	}
+	viewAuxiliaryState := func(fn synced_data.ViewHeadStateFn) error {
+		if current := f.forkGraph.CurrentStateLocked(root); current != nil {
+			return fn(current)
+		}
+		return errAuxiliaryStateNotCurrent
+	}
+	head, slot, err := f.getHeadNode(viewAuxiliaryState)
+	if errors.Is(err, errAuxiliaryStateNotCurrent) {
+		head, slot, err = f.getHeadWithReplayedAuxiliaryRoot(root)
+	}
+	return head.Root, slot, err
+}
+
+func (f *ForkChoiceStore) getHeadWithReplayedAuxiliaryRoot(root common.Hash) (ForkChoiceNode, uint64, error) {
+	replayed, err := f.forkGraph.ReplayState(root)
+	if err != nil {
+		return ForkChoiceNode{}, 0, err
+	}
+	if replayed == nil {
+		return ForkChoiceNode{}, 0, fmt.Errorf("failed to get auxiliary state for root %x", root)
+	}
+	return f.getHeadNode(func(fn synced_data.ViewHeadStateFn) error {
+		return fn(replayed)
+	})
 }
 
 // GetHeadWithSyncedHeadState reads the synced head state while holding the fork-choice lock, so callers must not hold a synced-data lock.
@@ -224,7 +264,15 @@ func (f *ForkChoiceStore) getHeadGloas() (ForkChoiceNode, uint64, error) {
 }
 
 func (f *ForkChoiceStore) gloasHeadCheckpointState(justifiedCheckpoint solid.Checkpoint) (*checkpointState, error) {
-	cs, err := f.getCheckpointState(justifiedCheckpoint)
+	return f.gloasHeadCheckpointStateWith(justifiedCheckpoint, f.getCheckpointState)
+}
+
+func (f *ForkChoiceStore) gloasHeadCheckpointStateLocked(justifiedCheckpoint solid.Checkpoint) (*checkpointState, error) {
+	return f.gloasHeadCheckpointStateWith(justifiedCheckpoint, f.getCheckpointStateLocked)
+}
+
+func (f *ForkChoiceStore) gloasHeadCheckpointStateWith(justifiedCheckpoint solid.Checkpoint, getCheckpointState func(solid.Checkpoint) (*checkpointState, error)) (*checkpointState, error) {
+	cs, err := getCheckpointState(justifiedCheckpoint)
 	if err != nil {
 		if _, hasJustified := f.forkGraph.GetHeader(justifiedCheckpoint.Root); !hasJustified {
 			return nil, nil

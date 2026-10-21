@@ -3,6 +3,7 @@ package forkchoice
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -427,4 +428,23 @@ func TestIsHeadWeak_NoCheckpointState(t *testing.T) {
 	f := newTestForkChoiceStore(12, 3, 32, math.MaxUint64, 0, 0)
 	f.justifiedCheckpoint.Store(solid.Checkpoint{})
 	require.False(t, f.isHeadWeak(common.Hash{0x01}))
+}
+
+func TestIsHeadWeakDoesNotRelockForkChoice(t *testing.T) {
+	checkpoint := checkpointStateCacheTestCheckpoints(1)[0]
+	store := newCheckpointStateCacheTestStore(t, []solid.Checkpoint{checkpoint}, checkpoint)
+	graph := store.forkGraph.(*getFinalizedExecutionHashForkGraph)
+	graph.currentStateRoot = checkpoint.Root
+	done := make(chan bool, 1)
+	go func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		done <- store.isHeadWeak(checkpoint.Root)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("isHeadWeak tried to reacquire the fork-choice lock")
+	}
 }

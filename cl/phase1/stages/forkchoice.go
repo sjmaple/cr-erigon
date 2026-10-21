@@ -208,45 +208,28 @@ func updateCanonicalChainInTheDatabase(tx kv.RwTx, headSlot uint64, headRoot com
 	return nil
 }
 
-// emitHeadEvent emits the head event with the given head slot, head root, and head state.
-func emitHeadEvent(beaconCfg *clparams.BeaconChainConfig, store forkchoice.ForkChoiceStorageReader, emitter *beaconevents.EventEmitter, headSlot uint64, headRoot common.Hash, headState *state.CachingBeaconState) error {
+func buildHeadEvent(beaconCfg *clparams.BeaconChainConfig, headSlot uint64, headRoot common.Hash, headState *state.CachingBeaconState, head forkchoice.ForkChoiceNode, executionOptimistic bool) (*beaconevents.HeadV2Data, common.Hash, error) {
 	stateRoot, err := headState.HashSSZ()
 	if err != nil {
-		return fmt.Errorf("failed to hash ssz: %w", err)
+		return nil, common.Hash{}, fmt.Errorf("failed to hash ssz: %w", err)
 	}
-	currentHead, currentHeadSlot, err := store.GetHeadNode()
-	if err != nil {
-		return fmt.Errorf("failed to revalidate head event: %w", err)
-	}
-	if currentHead.Root != headRoot || currentHeadSlot != headSlot {
-		return nil
-	}
-	isGloas := headState.Version() >= clparams.GloasVersion
 	payloadStatus := "full"
-	if isGloas {
-		payloadStatus = beaconevents.PayloadStatusName(currentHead.PayloadStatus)
+	if headState.Version() >= clparams.GloasVersion {
+		payloadStatus = beaconevents.PayloadStatusName(head.PayloadStatus)
 	}
-	executionOptimistic := store.IsRootOptimistic(headRoot)
-	headEvent, err := beaconevents.BuildHeadV2Data(
-		beaconCfg,
-		headState,
-		headSlot,
-		headRoot,
-		stateRoot,
-		payloadStatus,
-		executionOptimistic,
-	)
-	if err != nil {
-		return err
-	}
-	return emitHeadEventsIfCurrent(emitter, headEvent, headSlot, headRoot, stateRoot, func() (common.Hash, uint64, string, bool, error) {
+	headEvent, err := beaconevents.BuildHeadV2Data(beaconCfg, headState, headSlot, headRoot, stateRoot, payloadStatus, executionOptimistic)
+	return headEvent, stateRoot, err
+}
+
+func headEventRevalidator(store forkchoice.ForkChoiceStorageReader, isGloas bool) func() (common.Hash, uint64, string, bool, error) {
+	return func() (common.Hash, uint64, string, bool, error) {
 		head, slot, err := store.GetHeadNode()
-		currentPayloadStatus := "full"
+		payloadStatus := "full"
 		if isGloas {
-			currentPayloadStatus = beaconevents.PayloadStatusName(head.PayloadStatus)
+			payloadStatus = beaconevents.PayloadStatusName(head.PayloadStatus)
 		}
-		return head.Root, slot, currentPayloadStatus, store.IsRootOptimistic(head.Root), err
-	})
+		return head.Root, slot, payloadStatus, store.IsRootOptimistic(head.Root), err
+	}
 }
 
 func emitHeadEventsIfCurrent(emitter *beaconevents.EventEmitter, headEvent *beaconevents.HeadV2Data, headSlot uint64, headRoot, stateRoot common.Hash, getHead func() (common.Hash, uint64, string, bool, error)) error {
@@ -277,11 +260,11 @@ func emitHeadEventsIfCurrent(emitter *beaconevents.EventEmitter, headEvent *beac
 	return validationErr
 }
 
-func emitNextPaylodAttributesEvent(cfg *Cfg, headSlot uint64, headRoot common.Hash, s *state.CachingBeaconState) error {
+func buildNextPayloadAttributesEvent(cfg *Cfg, headSlot uint64, headRoot common.Hash, s *state.CachingBeaconState) (*beaconevents.PayloadAttributesData, error) {
 	// [GLOAS] payload_attributes event is obsolete in GLOAS: the builder gossips SignedExecutionPayloadBid
 	// instead, and LatestExecutionPayloadHeader is no longer updated in GLOAS states.
 	if cfg.beaconCfg.GetCurrentStateVersion(headSlot/cfg.beaconCfg.SlotsPerEpoch) >= clparams.GloasVersion {
-		return nil
+		return nil, nil
 	}
 	headPayloadHeader := s.LatestExecutionPayloadHeader().Copy()
 	nextSlot := headSlot + 1
@@ -292,11 +275,11 @@ func emitNextPaylodAttributesEvent(cfg *Cfg, headSlot uint64, headRoot common.Ha
 	proposerIndex, err := s.GetBeaconProposerIndexForSlot(nextSlot)
 	if err != nil {
 		log.Warn("failed to get proposer index", "err", err)
-		return err
+		return nil, err
 	}
 	expWithdrawals, err := state.GetExpectedWithdrawals(s, epoch)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	withdrawals := cltypes.ConvertConsensusWithdrawalsToExecutionWithdrawals(expWithdrawals.Withdrawals)
 	payloadAttributes := engine_types.PayloadAttributes{
@@ -315,7 +298,7 @@ func emitNextPaylodAttributesEvent(cfg *Cfg, headSlot uint64, headRoot common.Ha
 		}
 		payloadAttributes.TargetGasLimit = &tgl
 	}
-	e := &beaconevents.PayloadAttributesData{
+	return &beaconevents.PayloadAttributesData{
 		Version: cfg.beaconCfg.GetCurrentStateVersion(epoch).String(),
 		Data: beaconevents.PayloadAttributesContent{
 			ProposerIndex:     proposerIndex,
@@ -325,9 +308,7 @@ func emitNextPaylodAttributesEvent(cfg *Cfg, headSlot uint64, headRoot common.Ha
 			ParentBlockRoot:   headRoot,
 			PayloadAttributes: payloadAttributes,
 		},
-	}
-	cfg.emitter.State().SendPayloadAttributes(e)
-	return nil
+	}, nil
 }
 
 // writeFinalizedStateFile snappy-encodes st and replaces the finalized-state resume file via a
@@ -418,7 +399,7 @@ func saveFinalizedStateOnDiskIfNeeded(fc forkchoice.ForkChoiceStorageReader, bea
 	if headSlot%(beaconCfg.SlotsPerEpoch*epochFrequency) != 0 {
 		return nil
 	}
-	st, err := fc.GetStateAtBlockRoot(fc.FinalizedCheckpoint().Root, true)
+	st, err := fc.GetStateAtBlockRoot(fc.FinalizedCheckpoint().Root)
 	if err != nil {
 		log.Debug("[Caplin] could not fetch finalized state to persist (non-fatal)", "err", err)
 		return nil
@@ -432,51 +413,75 @@ func saveFinalizedStateOnDiskIfNeeded(fc forkchoice.ForkChoiceStorageReader, bea
 // postForkchoiceOperations performs the post fork choice operations such as updating the head state, producing and caching attestation data,
 // these sets of operations can take as long as they need to run, as by-now we are already synced.
 func postForkchoiceOperations(tx kv.RwTx, logger log.Logger, cfg *Cfg, headSlot uint64, headRoot common.Hash) error {
-	// Retrieve the head state.
-	headState, err := cfg.forkChoice.GetStateAtBlockRoot(headRoot, false)
+	head, currentHeadSlot, err := cfg.forkChoice.GetHeadNode()
+	headMatches := err == nil && head.Root == headRoot && currentHeadSlot == headSlot
 	if err != nil {
-		return fmt.Errorf("failed to get state at block root: %w", err)
+		logger.Warn("failed to get head node", "err", err)
 	}
-	// fail-safe check§
-	if headState == nil {
-		return nil
-	}
-	cfg.blobDownloader.SetHeadSlot(headSlot)
-	// First emit events that depend on the head state.
-	if err := emitHeadEvent(cfg.beaconCfg, cfg.forkChoice, cfg.emitter, headSlot, headRoot, headState); err != nil {
-		logger.Warn("failed to emit head event", "err", err)
-	}
-	if err := emitNextPaylodAttributesEvent(cfg, headSlot, headRoot, headState); err != nil {
-		logger.Warn("failed to emit next payload attributes event", "err", err)
-	}
-
-	if _, err = cfg.attestationDataProducer.ProduceAndCacheAttestationData(tx, headState, headRoot, headState.Slot()); err != nil {
-		logger.Warn("failed to produce and cache attestation data", "err", err)
+	executionOptimistic := false
+	if headMatches {
+		executionOptimistic = cfg.forkChoice.IsRootOptimistic(headRoot)
 	}
 	if err := beacon_indicies.WriteHighestFinalized(tx, cfg.forkChoice.FinalizedSlot()); err != nil {
 		return err
 	}
 	start := time.Now()
-	cfg.forkChoice.SetSynced(true) // Now we are synced
-	// Update the head state with the new head state
-	if err := cfg.syncedData.OnHeadStateWithBlockRoot(headState, headRoot); err != nil {
+	published, err := cfg.syncedData.OnHeadStateFrom(headRoot, cfg.forkChoice.CopyStateAtBlockRootInto)
+	if err != nil {
 		return fmt.Errorf("failed to set head state: %w", err)
 	}
+	if !published {
+		return nil
+	}
+	cfg.blobDownloader.SetHeadSlot(headSlot)
+	cfg.forkChoice.SetSynced(true)
 	defer func() {
 		logger.Debug("Post forkchoice operations", "duration", time.Since(start))
 	}()
 
-	if err := cfg.syncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
-		// Dump the head state on disk for ease of chain reorgs
-		if err := cfg.forkChoice.DumpBeaconStateOnDisk(headState); err != nil {
-			return fmt.Errorf("failed to dump beacon state on disk: %w", err)
+	var headEvent *beaconevents.HeadV2Data
+	var stateRoot common.Hash
+	var payloadAttributesEvent *beaconevents.PayloadAttributesData
+	var isGloas bool
+	var dumpErr error
+	if err := cfg.syncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, _ uint64) error {
+		if root == headRoot {
+			isGloas = headState.Version() >= clparams.GloasVersion
+			if headMatches {
+				var headEventErr error
+				headEvent, stateRoot, headEventErr = buildHeadEvent(cfg.beaconCfg, headSlot, headRoot, headState, head, executionOptimistic)
+				if headEventErr != nil {
+					logger.Warn("failed to build head event", "err", headEventErr)
+				}
+			}
+			var payloadErr error
+			payloadAttributesEvent, payloadErr = buildNextPayloadAttributesEvent(cfg, headSlot, headRoot, headState)
+			if payloadErr != nil {
+				logger.Warn("failed to build next payload attributes event", "err", payloadErr)
+			}
+			if _, produceErr := cfg.attestationDataProducer.ProduceAndCacheAttestationData(tx, headState, headRoot, headState.Slot()); produceErr != nil {
+				logger.Warn("failed to produce and cache attestation data", "err", produceErr)
+			}
 		}
-
-		// Shuffle validator set for the next epoch
+		if err := cfg.forkChoice.DumpBeaconStateOnDisk(headState); err != nil {
+			dumpErr = fmt.Errorf("failed to dump beacon state on disk: %w", err)
+			return nil
+		}
 		preCacheNextShuffledValidatorSet(logger, cfg, headState)
 		return nil
 	}); err != nil {
 		return err
+	}
+	if headEvent != nil {
+		if err := emitHeadEventsIfCurrent(cfg.emitter, headEvent, headSlot, headRoot, stateRoot, headEventRevalidator(cfg.forkChoice, isGloas)); err != nil {
+			logger.Warn("failed to emit head event", "err", err)
+		}
+	}
+	if payloadAttributesEvent != nil {
+		cfg.emitter.State().SendPayloadAttributes(payloadAttributesEvent)
+	}
+	if dumpErr != nil {
+		return dumpErr
 	}
 	if err := saveFinalizedStateOnDiskIfNeeded(cfg.forkChoice, cfg.beaconCfg, cfg.dirs, headSlot); err != nil {
 		return fmt.Errorf("failed to save finalized state on disk: %w", err)

@@ -117,6 +117,26 @@ func (s *SyncedDataManager) OnHeadStateWithBlockRoot(newState *state.CachingBeac
 	return s.publishHeadStateLocked(newState, blockRoot)
 }
 
+func (s *SyncedDataManager) OnHeadStateFrom(blockRoot common.Hash, copyState func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error)) (bool, error) {
+	if !s.enabled {
+		return false, nil
+	}
+	s.writeLock.Lock()
+	defer s.writeLock.Unlock()
+
+	copied, err := copyState(blockRoot, s.spareHeadState)
+	if err != nil {
+		s.spareHeadState = nil
+		return false, err
+	}
+	if copied == nil {
+		return false, nil
+	}
+	s.spareHeadState = nil
+	s.swapHeadStateLocked(copied, blockRoot)
+	return true, nil
+}
+
 // publishHeadStateLocked materializes newState into a standalone copy and
 // swaps it in as the head state, demoting the current head state to
 // previous. Callers must hold writeLock for the duration of whatever work
@@ -130,7 +150,13 @@ func (s *SyncedDataManager) publishHeadStateLocked(newState *state.CachingBeacon
 	if err != nil {
 		return err
 	}
+	s.swapHeadStateLocked(copied, blockRoot)
+	return nil
+}
 
+func (s *SyncedDataManager) swapHeadStateLocked(copied *state.CachingBeaconState, blockRoot common.Hash) {
+	// Build the pubkey index before taking mu and accessLock, so readers never wait for it.
+	_, _ = copied.ValidatorIndexByPubkey([48]byte{})
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.accessLock.Lock()
@@ -139,8 +165,7 @@ func (s *SyncedDataManager) publishHeadStateLocked(newState *state.CachingBeacon
 	s.spareHeadState = s.previousHeadState
 	s.previousHeadState = s.headState
 	s.headState = copied
-	s.stateHead.Store(&headIdentity{root: blockRoot, slot: newState.Slot()})
-	return nil
+	s.stateHead.Store(&headIdentity{root: blockRoot, slot: copied.Slot()})
 }
 
 // copyState performs the copy that publishHeadState swaps in. copyHookForTest,

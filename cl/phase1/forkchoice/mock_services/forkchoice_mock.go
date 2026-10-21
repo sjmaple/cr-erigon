@@ -60,7 +60,9 @@ type ForkChoiceStorageMock struct {
 	HeadPayloadStatusVal                  cltypes.PayloadStatus
 	BlockProcessingVal                    bool
 	GetHeadNodeFn                         func() (forkchoice.ForkChoiceNode, uint64, error)
-	GetStateAtBlockRootFn                 func(common.Hash, bool) (*state.CachingBeaconState, error)
+	GetHeadWithAuxiliaryRootFn            func(common.Hash) (common.Hash, uint64, error)
+	GetStateAtBlockRootFn                 func(common.Hash) (*state.CachingBeaconState, error)
+	CopyStateAtBlockRootIntoFn            func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error)
 	ViewStateAtBlockRootFn                func(common.Hash, func(*state.CachingBeaconState) error) error
 	HighestSeenVal                        uint64
 	// HighestImportedDescendantVal is the slot of the highest imported descendant of any root,
@@ -320,6 +322,13 @@ func (f *ForkChoiceStorageMock) GetHead(_ *state.CachingBeaconState) (common.Has
 	return f.HeadVal, f.HeadSlotVal, nil
 }
 
+func (f *ForkChoiceStorageMock) GetHeadWithAuxiliaryRoot(root common.Hash) (common.Hash, uint64, error) {
+	if f.GetHeadWithAuxiliaryRootFn != nil {
+		return f.GetHeadWithAuxiliaryRootFn(root)
+	}
+	return f.HeadVal, f.HeadSlotVal, nil
+}
+
 func (f *ForkChoiceStorageMock) HighestSeen() uint64 {
 	return f.HighestSeenVal
 }
@@ -347,25 +356,36 @@ func (f *ForkChoiceStorageMock) ProposerBoostRoot() common.Hash {
 	return f.ProposerBoostRootVal
 }
 
-func (f *ForkChoiceStorageMock) GetStateAtBlockRoot(
-	blockRoot common.Hash,
-	alwaysCopy bool,
-) (*state.CachingBeaconState, error) {
+func (f *ForkChoiceStorageMock) GetStateAtBlockRoot(blockRoot common.Hash) (*state.CachingBeaconState, error) {
 	if f.GetStateAtBlockRootFn != nil {
-		return f.GetStateAtBlockRootFn(blockRoot, alwaysCopy)
+		return f.GetStateAtBlockRootFn(blockRoot)
 	}
 	st := f.StateAtBlockRootVal[blockRoot]
-	if st == nil || !alwaysCopy {
-		return st, nil
+	if st == nil {
+		return nil, nil
 	}
 	return st.Copy()
+}
+
+func (f *ForkChoiceStorageMock) CopyStateAtBlockRootInto(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+	if f.CopyStateAtBlockRootIntoFn != nil {
+		return f.CopyStateAtBlockRootIntoFn(blockRoot, dst)
+	}
+	st := f.StateAtBlockRootVal[blockRoot]
+	if st == nil {
+		return nil, nil
+	}
+	if dst == nil || dst.BeaconConfig() != st.BeaconConfig() {
+		return st.Copy()
+	}
+	return dst, st.CopyInto(dst)
 }
 
 func (f *ForkChoiceStorageMock) ViewStateAtBlockRoot(blockRoot common.Hash, fn func(*state.CachingBeaconState) error) error {
 	if f.ViewStateAtBlockRootFn != nil {
 		return f.ViewStateAtBlockRootFn(blockRoot, fn)
 	}
-	blockState, err := f.GetStateAtBlockRoot(blockRoot, false)
+	blockState, err := f.GetStateAtBlockRoot(blockRoot)
 	if err != nil {
 		return err
 	}

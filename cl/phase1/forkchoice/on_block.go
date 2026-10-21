@@ -152,7 +152,7 @@ func (f *ForkChoiceStore) ValidateBlockForPublishing(block *cltypes.SignedBeacon
 		f.mu.RUnlock()
 		return nil
 	}
-	parentState, err := f.forkGraph.GetState(block.Block.ParentRoot, true)
+	parentState, err := f.copyStateAtBlockRootLocked(block.Block.ParentRoot, nil)
 	f.mu.RUnlock()
 	if err != nil {
 		return err
@@ -264,7 +264,7 @@ func (f *ForkChoiceStore) onBlock(ctx context.Context, block *cltypes.SignedBeac
 	headBeforeBlock := common.Hash{}
 	if isGloas && f.Slot() == block.Block.Slot {
 		justifiedCheckpoint := f.justifiedCheckpoint.Load().(solid.Checkpoint)
-		cs, err := f.gloasHeadCheckpointState(justifiedCheckpoint)
+		cs, err := f.gloasHeadCheckpointStateLocked(justifiedCheckpoint)
 		if err != nil {
 			return err
 		}
@@ -432,7 +432,7 @@ func (f *ForkChoiceStore) onBlock(ctx context.Context, block *cltypes.SignedBeac
 	// not via a separate execution_payload_state. We still validate that the parent's
 	// payload was received (store.payloads check) via validateParentPayloadPath above.
 
-	lastProcessedState, status, err := f.addChainSegmentAndQueueLightClientEvents(block, fullValidation)
+	status, err := f.addChainSegmentAndQueueLightClientEvents(block, fullValidation)
 	if err != nil {
 		if status == fork_graph.InvalidBlock {
 			return invalidBlockError(err)
@@ -458,6 +458,10 @@ func (f *ForkChoiceStore) onBlock(ctx context.Context, block *cltypes.SignedBeac
 		return ErrMissingSegment
 	default:
 		return fmt.Errorf("replay block, status %+v", status)
+	}
+	lastProcessedState := f.forkGraph.CurrentStateLocked(common.Hash(blockRoot))
+	if lastProcessedState == nil {
+		return errors.New("current state missing after successful block import")
 	}
 	if block.Block.Body.ExecutionPayload != nil {
 		f.eth2Roots.Add(blockRoot, block.Block.Body.ExecutionPayload.BlockHash)
@@ -1072,14 +1076,14 @@ func (f *ForkChoiceStore) retryPendingEnvelopeError(err error, pending *cltypes.
 	return payloadSlot >= finalizedSlot
 }
 
-func (f *ForkChoiceStore) addChainSegmentAndQueueLightClientEvents(block *cltypes.SignedBeaconBlock, fullValidation bool) (*state.CachingBeaconState, fork_graph.ChainSegmentInsertionResult, error) {
+func (f *ForkChoiceStore) addChainSegmentAndQueueLightClientEvents(block *cltypes.SignedBeaconBlock, fullValidation bool) (fork_graph.ChainSegmentInsertionResult, error) {
 	lcUpdateBefore := f.forkGraph.NewestLightClientUpdate()
-	lastProcessedState, status, err := f.forkGraph.AddChainSegment(block, fullValidation)
+	status, err := f.forkGraph.AddChainSegment(block, fullValidation)
 	if err != nil {
-		return nil, status, err
+		return status, err
 	}
 	f.queueLightClientEvents(lcUpdateBefore, block.Version().String())
-	return lastProcessedState, status, nil
+	return status, nil
 }
 
 // queueLightClientEvents emits the light client events for an update stored by

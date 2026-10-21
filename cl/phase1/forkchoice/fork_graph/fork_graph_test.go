@@ -339,20 +339,20 @@ func TestForkGraphInDisk(t *testing.T) {
 	require.NoError(t, utils.DecodeSSZSnappy(anchorState, anchor, int(clparams.Phase0Version)))
 	graph, err := NewForkGraphDisk(anchorState, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{})
 	require.NoError(t, err)
-	_, status, err := graph.AddChainSegment(blockA, true)
+	status, err := graph.AddChainSegment(blockA, true)
 	require.NoError(t, err)
 	require.Equal(t, Success, status)
 	// Now make blockC a bad block
 	blockC.Block.ProposerIndex = 81214459 // some invalid thing
-	_, status, err = graph.AddChainSegment(blockC, true)
+	status, err = graph.AddChainSegment(blockC, true)
 	require.Error(t, err)
 	require.Equal(t, InvalidBlock, status)
 	// Save current state hash
-	_, status, err = graph.AddChainSegment(blockB, true)
+	status, err = graph.AddChainSegment(blockB, true)
 	require.NoError(t, err)
 	require.Equal(t, Success, status)
 	// Try again with same should yield success
-	_, status, err = graph.AddChainSegment(blockB, true)
+	status, err = graph.AddChainSegment(blockB, true)
 	require.NoError(t, err)
 	require.Equal(t, PreValidated, status)
 }
@@ -487,13 +487,16 @@ func TestNewForkGraphDiskCachesAnchorStateRoot(t *testing.T) {
 			}
 			anchorRoot, err := anchorState.BlockRoot()
 			require.NoError(t, err)
+			callerHeaderRoot := anchorState.LatestBlockHeader().Root
 
 			forkGraph, err := NewForkGraphDisk(anchorState, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{})
 			require.NoError(t, err)
 			graph := forkGraph.(*forkGraphDisk)
 
 			require.Equal(t, common.Hash(expectedStateRoot), anchorState.PeekPreviousStateRoot())
-			require.Equal(t, header.Root, anchorState.LatestBlockHeader().Root)
+			require.Equal(t, callerHeaderRoot, anchorState.LatestBlockHeader().Root)
+			require.Equal(t, common.Hash(expectedStateRoot), graph.currentState.PeekPreviousStateRoot())
+			require.Equal(t, header.Root, graph.currentState.LatestBlockHeader().Root)
 			persistedState, err := graph.readBeaconStateFromDisk(anchorRoot)
 			require.NoError(t, err)
 			require.Equal(t, common.Hash(expectedStateRoot), persistedState.PeekPreviousStateRoot())
@@ -600,7 +603,7 @@ func TestPruneKeepsParticipationIndicesFromRetainedConcurrentAdd(t *testing.T) {
 		t.Fatal("prune did not publish its boundary")
 	}
 	require.Equal(t, blockSlot, f.LowestAvailableSlot())
-	_, result, err := f.AddChainSegment(block, false)
+	result, err := f.AddChainSegment(block, false)
 	require.NoError(t, err)
 	require.Equal(t, Success, result)
 	close(continuePrune)
@@ -645,7 +648,7 @@ func TestPruneKeepsParticipationIndicesFromRetainedPriorAdd(t *testing.T) {
 		currentState:          beaconState,
 		currentStateBlockRoot: common.Hash(blockRoot),
 	}
-	_, result, err := f.AddChainSegment(block, false)
+	result, err := f.AddChainSegment(block, false)
 	require.NoError(t, err)
 	require.Equal(t, Success, result)
 	newerRoot := common.Hash{0xfe}
@@ -806,7 +809,7 @@ func TestValidatedChildQueryProgressesDuringPruneLifecycle(t *testing.T) {
 	oldBlock.Block.Slot = 63
 	addDone := make(chan ChainSegmentInsertionResult, 1)
 	go func() {
-		_, result, _ := f.AddChainSegment(oldBlock, true)
+		result, _ := f.AddChainSegment(oldBlock, true)
 		addDone <- result
 	}()
 	select {
@@ -821,7 +824,7 @@ func TestValidatedChildQueryProgressesDuringPruneLifecycle(t *testing.T) {
 	aboveBlock.Block.Slot = 129
 	aboveAddDone := make(chan ChainSegmentInsertionResult, 1)
 	go func() {
-		_, result, _ := f.AddChainSegment(aboveBlock, true)
+		result, _ := f.AddChainSegment(aboveBlock, true)
 		aboveAddDone <- result
 	}()
 	select {
@@ -1033,7 +1036,7 @@ func TestAddChainSegmentRejectsSlotBelowPrunedBoundary(t *testing.T) {
 	block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.GloasVersion)
 	block.Block.Slot = 63
 
-	_, status, err := f.AddChainSegment(block, true)
+	status, err := f.AddChainSegment(block, true)
 	require.NoError(t, err)
 	require.Equal(t, BelowAnchor, status)
 	root, err := block.Block.HashSSZ()
@@ -1050,7 +1053,7 @@ func TestAddChainSegmentDoesNotExcludeLifecycleReaders(t *testing.T) {
 	anchorState := state.New(&clparams.MainnetBeaconConfig)
 	require.NoError(t, utils.DecodeSSZSnappy(block, block1, int(clparams.Phase0Version)))
 	require.NoError(t, utils.DecodeSSZSnappy(anchorState, anchor, int(clparams.Phase0Version)))
-	graph, err := NewForkGraphDisk(anchorState, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{})
+	graph, err := NewForkGraphDisk(anchorState, nil, afero.NewMemMapFs(), beacon_router_configuration.RouterConfiguration{Beacon: true})
 	require.NoError(t, err)
 	f := graph.(*forkGraphDisk)
 	blockRoot, err := block.Block.HashSSZ()
@@ -1069,7 +1072,7 @@ func TestAddChainSegmentDoesNotExcludeLifecycleReaders(t *testing.T) {
 		err    error
 	}, 1)
 	go func() {
-		_, result, err := f.AddChainSegment(block, true)
+		result, err := f.AddChainSegment(block, true)
 		done <- struct {
 			result ChainSegmentInsertionResult
 			err    error
@@ -1079,9 +1082,7 @@ func TestAddChainSegmentDoesNotExcludeLifecycleReaders(t *testing.T) {
 	statePublished := make(chan struct{})
 	go func() {
 		for {
-			f.currentStateMu.RLock()
-			published := f.currentStateBlockRoot == common.Hash(blockRoot)
-			f.currentStateMu.RUnlock()
+			_, _, published := f.GetSyncCommittees(f.beaconCfg.SyncCommitteePeriod(block.Block.Slot))
 			if published {
 				close(statePublished)
 				return

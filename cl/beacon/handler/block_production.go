@@ -3144,7 +3144,7 @@ func (a *ApiHandler) storeBlockAndBlobs(
 		return err
 	}
 
-	headRoot, headSlot, headState, err := a.selectedHeadState(blockRoot)
+	headRoot, headSlot, err := a.forkchoiceStore.GetHeadWithAuxiliaryRoot(blockRoot)
 	if err != nil {
 		return err
 	}
@@ -3160,14 +3160,23 @@ func (a *ApiHandler) storeBlockAndBlobs(
 		log.Debug("BlockProduction: forkchoice update timed out while storing block", "root", headRoot)
 	}
 
+	published, err := a.syncedData.OnHeadStateFrom(headRoot, a.forkchoiceStore.CopyStateAtBlockRootInto)
+	if err != nil {
+		return fmt.Errorf("failed to update synced data: %w", err)
+	}
+	if !published {
+		return fmt.Errorf("failed to update synced data: state not found for root %s", headRoot)
+	}
 	if err := a.indiciesDB.View(ctx, func(tx kv.Tx) error {
-		_, err := a.attestationProducer.ProduceAndCacheAttestationData(tx, headState, headRoot, block.Block.Slot)
-		return err
+		return a.syncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, _ uint64) error {
+			if root != headRoot {
+				return nil
+			}
+			_, err := a.attestationProducer.ProduceAndCacheAttestationData(tx, headState, headRoot, block.Block.Slot)
+			return err
+		})
 	}); err != nil {
 		return err
-	}
-	if err := a.syncedData.OnHeadStateWithBlockRoot(headState, headRoot); err != nil {
-		return fmt.Errorf("failed to update synced data: %w", err)
 	}
 
 	return nil
@@ -3197,31 +3206,6 @@ func (a *ApiHandler) storeDataColumnSidecars(ctx context.Context, blockRoot comm
 		}
 	}
 	return nil
-}
-
-func (a *ApiHandler) selectedHeadState(auxiliaryRoot common.Hash) (common.Hash, uint64, *state.CachingBeaconState, error) {
-	auxiliaryState, err := a.forkchoiceStore.GetStateAtBlockRoot(auxiliaryRoot, false)
-	if err != nil {
-		return common.Hash{}, 0, nil, err
-	}
-	if auxiliaryState == nil {
-		return common.Hash{}, 0, nil, fmt.Errorf("failed to get auxiliary state for root %s", auxiliaryRoot)
-	}
-	headRoot, headSlot, err := a.forkchoiceStore.GetHead(auxiliaryState)
-	if err != nil {
-		return common.Hash{}, 0, nil, err
-	}
-	if headRoot == auxiliaryRoot {
-		return headRoot, headSlot, auxiliaryState, nil
-	}
-	headState, err := a.forkchoiceStore.GetStateAtBlockRoot(headRoot, false)
-	if err != nil {
-		return common.Hash{}, 0, nil, err
-	}
-	if headState == nil {
-		return common.Hash{}, 0, nil, fmt.Errorf("failed to get selected head state for root %s", headRoot)
-	}
-	return headRoot, headSlot, headState, nil
 }
 
 // attestationCandidate holds, per attester, the participation flags the attestation would newly set.

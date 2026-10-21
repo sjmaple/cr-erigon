@@ -48,6 +48,7 @@ type ForkChoiceStorageReader interface {
 	// GetFinalizedExecutionHash returns the EL block hash for finalized/justified checkpoints.
 	GetFinalizedExecutionHash(eth2Root common.Hash) common.Hash
 	GetHead(auxilliaryState *state.CachingBeaconState) (common.Hash, uint64, error)
+	GetHeadWithAuxiliaryRoot(root common.Hash) (common.Hash, uint64, error)
 	GetHeadNode() (ForkChoiceNode, uint64, error)
 	HighestSeen() uint64
 	HasImportedDescendantAfter(root common.Hash, slot uint64) bool
@@ -55,10 +56,9 @@ type ForkChoiceStorageReader interface {
 	JustifiedCheckpoint() solid.Checkpoint
 	JustifiedSlot() uint64
 	ProposerBoostRoot() common.Hash
-	GetStateAtBlockRoot(
-		blockRoot common.Hash,
-		alwaysCopy bool,
-	) (*state.CachingBeaconState, error)
+	GetStateAtBlockRoot(blockRoot common.Hash) (*state.CachingBeaconState, error)
+	CopyStateAtBlockRootInto(blockRoot common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error)
+	// ViewStateAtBlockRoot callbacks must not call fork choice.
 	ViewStateAtBlockRoot(blockRoot common.Hash, fn func(*state.CachingBeaconState) error) error
 	GetFinalityCheckpoints(
 		blockRoot common.Hash,

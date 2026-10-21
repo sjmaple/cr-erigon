@@ -1,8 +1,13 @@
 package stages
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"math"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +23,7 @@ import (
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
+	"github.com/erigontech/erigon/cl/phase1/core/caches"
 	"github.com/erigontech/erigon/cl/phase1/core/checkpoint_sync"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
@@ -47,11 +53,62 @@ type pausingHeadView struct {
 	release chan struct{}
 }
 
+type unpublishedHeadState struct {
+	synced_data.SyncedData
+}
+
+func (s *unpublishedHeadState) OnHeadStateFrom(common.Hash, func(common.Hash, *state.CachingBeaconState) (*state.CachingBeaconState, error)) (bool, error) {
+	return false, nil
+}
+
+type mismatchedHeadIdentity struct {
+	synced_data.SyncedData
+}
+
+func (s *mismatchedHeadIdentity) ViewHeadStateWithIdentity(fn synced_data.ViewHeadStateWithIdentityFn) error {
+	return s.SyncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, _ common.Hash, slot uint64) error {
+		return fn(headState, common.Hash{0xff}, slot)
+	})
+}
+
+type failingWriteFs struct {
+	afero.Fs
+	fail atomic.Bool
+}
+
+type failingHighestFinalizedTx struct {
+	kv.RwTx
+}
+
+var mismatchPreCacheRoot atomic.Uint32
+
+func (tx *failingHighestFinalizedTx) Put(table string, key, value []byte) error {
+	if table == kv.HighestFinalized && bytes.Equal(key, kv.HighestFinalizedKey) {
+		return errors.New("highest finalized write failed")
+	}
+	return tx.RwTx.Put(table, key, value)
+}
+
+func (f *failingWriteFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	if f.fail.Load() && flag&(os.O_WRONLY|os.O_RDWR) != 0 {
+		return nil, errors.New("write failed")
+	}
+	return f.Fs.OpenFile(name, flag, perm)
+}
+
 func (s *pausingHeadView) ViewHeadState(fn synced_data.ViewHeadStateFn) error {
 	return s.SyncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
 		close(s.entered)
 		<-s.release
 		return fn(headState)
+	})
+}
+
+func (s *pausingHeadView) ViewHeadStateWithIdentity(fn synced_data.ViewHeadStateWithIdentityFn) error {
+	return s.SyncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, slot uint64) error {
+		close(s.entered)
+		<-s.release
+		return fn(headState, root, slot)
 	})
 }
 
@@ -71,6 +128,18 @@ type noOpAttestationDataProducer struct {
 	attestation_producer.AttestationDataProducer
 }
 
+type recordingAttestationDataProducer struct {
+	attestation_producer.AttestationDataProducer
+	state *state.CachingBeaconState
+	root  common.Hash
+}
+
+func (p *recordingAttestationDataProducer) ProduceAndCacheAttestationData(_ kv.Tx, st *state.CachingBeaconState, root common.Hash, _ uint64) (solid.AttestationData, error) {
+	p.state = st
+	p.root = root
+	return solid.AttestationData{}, nil
+}
+
 func (noOpAttestationDataProducer) ProduceAndCacheAttestationData(kv.Tx, *state.CachingBeaconState, common.Hash, uint64) (solid.AttestationData, error) {
 	return solid.AttestationData{}, nil
 }
@@ -85,6 +154,16 @@ type lockOrderFixture struct {
 
 func newLockOrderFixture(t *testing.T, slot uint64) lockOrderFixture {
 	t.Helper()
+	return newLockOrderFixtureWithFS(t, slot, afero.NewMemMapFs())
+}
+
+func newLockOrderFixtureWithFS(t *testing.T, slot uint64, fs afero.Fs) lockOrderFixture {
+	t.Helper()
+	return newLockOrderFixtureWithFSAndBlockRoot(t, slot, fs, common.Hash{})
+}
+
+func newLockOrderFixtureWithFSAndBlockRoot(t *testing.T, slot uint64, fs afero.Fs, blockRoot common.Hash) lockOrderFixture {
+	t.Helper()
 	beaconCfg := clparams.MainnetBeaconConfig
 	beaconCfg.GloasForkEpoch = math.MaxUint64
 	genesisTime := uint64(time.Now().Unix()) - slot*beaconCfg.SecondsPerSlot
@@ -92,14 +171,24 @@ func newLockOrderFixture(t *testing.T, slot uint64) lockOrderFixture {
 	headState := state.New(&beaconCfg)
 	headState.SetGenesisTime(genesisTime)
 	require.NoError(t, headState.SetSlot(slot))
+	if blockRoot != (common.Hash{}) {
+		epoch := state.Epoch(headState) + 1
+		refSlot := (epoch-1)*beaconCfg.SlotsPerEpoch - 1
+		require.NoError(t, headState.SetBlockRootAt(int(refSlot%beaconCfg.SlotsPerHistoricalRoot), blockRoot))
+	}
 	headState.SetLatestBlockHeader(&cltypes.BeaconBlockHeader{Slot: slot})
+	validator := solid.NewValidatorFromParameters(
+		common.Bytes48{}, common.Hash{}, beaconCfg.MaxEffectiveBalance, false,
+		0, 0, beaconCfg.FarFutureEpoch, beaconCfg.FarFutureEpoch,
+	)
+	require.NoError(t, headState.AddValidator(validator, beaconCfg.MaxEffectiveBalance))
 
 	manager := synced_data.NewSyncedDataManager(&beaconCfg, true)
 	emitter := beaconevents.NewEventEmitter()
 	graph, err := fork_graph.NewForkGraphDisk(
 		headState,
 		manager,
-		afero.NewMemMapFs(),
+		fs,
 		beacon_router_configuration.RouterConfiguration{},
 	)
 	require.NoError(t, err)
@@ -130,7 +219,7 @@ func newLockOrderFixture(t *testing.T, slot uint64) lockOrderFixture {
 	}
 	return lockOrderFixture{
 		cfg: &Cfg{
-			rpc:        rpc.NewBeaconRpcP2P(t.Context(), &statusSentinel{}, &beaconCfg, clock, headState),
+			rpc:        rpc.NewBeaconRpcP2P(t.Context(), &statusSentinel{}, &beaconCfg, clock),
 			ethClock:   clock,
 			beaconCfg:  &beaconCfg,
 			forkChoice: store,
@@ -224,6 +313,168 @@ func TestPostForkchoiceOperationsDoesNotInvertSyncedDataLockOrder(t *testing.T) 
 	require.NoError(t, err)
 }
 
+func TestPostForkchoiceOperationsUsesPublishedSyncedHead(t *testing.T) {
+	fixture := newLockOrderFixture(t, 1)
+	producer := &recordingAttestationDataProducer{}
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	fixture.cfg.attestationDataProducer = producer
+	fixture.cfg.syncedData = fixture.syncedData
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+
+	require.NoError(t, postForkchoiceOperations(tx, log.New(), fixture.cfg, fixture.headState.Slot(), fixture.headRoot))
+	require.Equal(t, fixture.headRoot, producer.root)
+	require.NoError(t, fixture.syncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, slot uint64) error {
+		require.Same(t, producer.state, headState)
+		require.Equal(t, fixture.headRoot, root)
+		require.Equal(t, fixture.headState.Slot(), slot)
+		return nil
+	}))
+}
+
+func TestPostForkchoiceOperationsPublishesWhenHeadMoved(t *testing.T) {
+	fixture := newLockOrderFixture(t, 1)
+	producer := &recordingAttestationDataProducer{}
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	fixture.cfg.attestationDataProducer = producer
+	fixture.cfg.syncedData = fixture.syncedData
+	events := make(chan *beaconevents.EventStream, 4)
+	subscription := fixture.cfg.emitter.State().Subscribe(events)
+	defer subscription.Unsubscribe()
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+	var previousHead *state.CachingBeaconState
+	require.NoError(t, fixture.syncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
+		previousHead = headState
+		return nil
+	}))
+
+	require.NoError(t, postForkchoiceOperations(tx, log.New(), fixture.cfg, fixture.headState.Slot()+1, fixture.headRoot))
+	require.Equal(t, fixture.headRoot, producer.root)
+	require.NoError(t, fixture.syncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, _ uint64) error {
+		require.NotSame(t, previousHead, headState)
+		require.Same(t, producer.state, headState)
+		require.Equal(t, fixture.headRoot, root)
+		return nil
+	}))
+	for len(events) > 0 {
+		event := <-events
+		require.NotEqual(t, beaconevents.StateHead, event.Event)
+		require.NotEqual(t, beaconevents.StateHeadV2, event.Event)
+	}
+}
+
+func TestPostForkchoiceOperationsWritesFinalizationButDoesNotSetHeadBeforePublish(t *testing.T) {
+	fixture := newLockOrderFixture(t, 1)
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	fixture.cfg.attestationDataProducer = noOpAttestationDataProducer{}
+	fixture.cfg.syncedData = &unpublishedHeadState{SyncedData: fixture.syncedData}
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+	require.NoError(t, beacon_indicies.WriteHighestFinalized(tx, 99))
+	finalizedSlot := fixture.cfg.forkChoice.FinalizedSlot()
+
+	require.NoError(t, postForkchoiceOperations(tx, log.New(), fixture.cfg, fixture.headState.Slot(), fixture.headRoot))
+	require.Zero(t, fixture.cfg.blobDownloader.HeadSlot())
+	require.False(t, fixture.cfg.forkChoice.Synced())
+	highestFinalized, err := beacon_indicies.ReadHighestFinalized(tx)
+	require.NoError(t, err)
+	require.Equal(t, finalizedSlot, highestFinalized)
+}
+
+func TestPostForkchoiceOperationsDoesNotPublishBeforeHighestFinalizedWrite(t *testing.T) {
+	fixture := newLockOrderFixture(t, 1)
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	fixture.cfg.attestationDataProducer = noOpAttestationDataProducer{}
+	fixture.cfg.syncedData = fixture.syncedData
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+	var previousHead *state.CachingBeaconState
+	require.NoError(t, fixture.syncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
+		previousHead = headState
+		return nil
+	}))
+
+	err = postForkchoiceOperations(&failingHighestFinalizedTx{RwTx: tx}, log.New(), fixture.cfg, fixture.headState.Slot(), fixture.headRoot)
+	require.ErrorContains(t, err, "highest finalized write failed")
+	require.NoError(t, fixture.syncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
+		require.Same(t, previousHead, headState)
+		return nil
+	}))
+}
+
+func TestPostForkchoiceOperationsMaintainsPublishedStateAfterIdentityChanges(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	var preCacheRoot common.Hash
+	binary.BigEndian.PutUint32(preCacheRoot[:], mismatchPreCacheRoot.Add(1))
+	fixture := newLockOrderFixtureWithFSAndBlockRoot(t, clparams.MainnetBeaconConfig.SlotsPerEpoch*12_345, fs, preCacheRoot)
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	producer := &recordingAttestationDataProducer{}
+	fixture.cfg.attestationDataProducer = producer
+	fixture.cfg.syncedData = &mismatchedHeadIdentity{SyncedData: fixture.syncedData}
+	fixture.cfg.dirs = datadir.New(t.TempDir())
+	stateFilename := fmt.Sprintf("%x.snappy_ssz", fixture.headRoot)
+	require.NoError(t, fs.Remove(stateFilename))
+	require.Eventually(t, func() bool { return !workingPreCacheNextShuffledValidatorSet.Load() }, 10*time.Second, time.Millisecond)
+	epoch := state.Epoch(fixture.headState) + 1
+	refSlot := (epoch-1)*fixture.cfg.beaconCfg.SlotsPerEpoch - 1
+	blockRoot, err := fixture.headState.GetBlockRootAtSlot(refSlot)
+	require.NoError(t, err)
+	_, cached := caches.ShuffledIndiciesCacheGlobal.Get(epoch, blockRoot)
+	require.False(t, cached)
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+
+	require.NoError(t, postForkchoiceOperations(tx, log.New(), fixture.cfg, fixture.headState.Slot(), fixture.headRoot))
+	_, err = checkpoint_sync.ReadLocalFinalizedState(fixture.cfg.dirs, fixture.cfg.beaconCfg)
+	require.NoError(t, err)
+	exists, err := afero.Exists(fs, stateFilename)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Nil(t, producer.state)
+	require.Eventually(t, func() bool {
+		_, ok := caches.ShuffledIndiciesCacheGlobal.Get(epoch, blockRoot)
+		return ok
+	}, 10*time.Second, time.Millisecond)
+}
+
+func TestPostForkchoiceOperationsEmitsEventsBeforeReturningDumpError(t *testing.T) {
+	fs := &failingWriteFs{Fs: afero.NewMemMapFs()}
+	fixture := newLockOrderFixtureWithFS(t, 4, fs)
+	fixture.cfg.blobDownloader = &network2.BlobHistoryDownloader{}
+	fixture.cfg.attestationDataProducer = noOpAttestationDataProducer{}
+	fixture.cfg.syncedData = fixture.syncedData
+	events := make(chan *beaconevents.EventStream, 4)
+	subscription := fixture.cfg.emitter.State().Subscribe(events)
+	defer subscription.Unsubscribe()
+	db := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
+	tx, err := db.BeginRw(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(tx.Rollback)
+	fs.fail.Store(true)
+
+	err = postForkchoiceOperations(tx, log.New(), fixture.cfg, fixture.headState.Slot(), fixture.headRoot)
+	require.ErrorContains(t, err, "failed to dump beacon state on disk")
+	seen := map[beaconevents.EventTopic]bool{}
+	for len(events) > 0 {
+		event := <-events
+		seen[event.Event] = true
+	}
+	require.True(t, seen[beaconevents.StateHead])
+	require.True(t, seen[beaconevents.StateHeadV2])
+	require.True(t, seen[beaconevents.StatePayloadAttributes])
+}
+
 func TestPayloadAttributesUseSepoliaGasLimitScheduleAtGloas(t *testing.T) {
 	_, config := clparams.GetConfigsByNetwork(chainspec.SepoliaChainID)
 	headSlot := config.GloasForkEpoch*config.SlotsPerEpoch - 1
@@ -240,7 +491,10 @@ func TestPayloadAttributesUseSepoliaGasLimitScheduleAtGloas(t *testing.T) {
 		emitter:   emitter,
 	}
 
-	require.NoError(t, emitNextPaylodAttributesEvent(cfg, headSlot, common.Hash{}, headState))
+	event, err := buildNextPayloadAttributesEvent(cfg, headSlot, common.Hash{}, headState)
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	cfg.emitter.State().SendPayloadAttributes(event)
 
 	require.Len(t, events, 1)
 	attrs := (<-events).Data.(*beaconevents.PayloadAttributesData).Data.PayloadAttributes
@@ -540,7 +794,11 @@ func TestEmitHeadEventKeepsPayloadStatusWithHeadSnapshot(t *testing.T) {
 			events := make(chan *beaconevents.EventStream, 2)
 			subscription := emitter.State().Subscribe(events)
 			defer subscription.Unsubscribe()
-			require.NoError(t, emitHeadEvent(&beaconCfg, store, emitter, store.HeadSlotVal, store.HeadVal, headState))
+			head, slot, err := store.GetHeadNode()
+			require.NoError(t, err)
+			headEvent, stateRoot, err := buildHeadEvent(&beaconCfg, store.HeadSlotVal, store.HeadVal, headState, head, store.IsRootOptimistic(store.HeadVal))
+			require.NoError(t, err)
+			require.NoError(t, emitHeadEventsIfCurrent(emitter, headEvent, slot, head.Root, stateRoot, headEventRevalidator(store, true)))
 
 			require.Equal(t, 2, store.reads)
 			require.Len(t, events, 2, "cache invalidation must not drop a matching FULL head event")

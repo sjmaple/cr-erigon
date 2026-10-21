@@ -2542,6 +2542,96 @@ func TestStoreBlockAndBlobsDoesNotRepeatForkchoiceAfterDatabaseFailure(t *testin
 	require.Equal(t, 1, installing.onBlockCalls)
 }
 
+func TestStoreBlockAndBlobsPublishesWinningHeadState(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	_, blocks, _, _, postState, handler, _, syncedData, fcu, _ := setupTestingHandler(t, clparams.Phase0Version, log.Root(), true)
+	block := blocks[1]
+	blockRoot, err := block.Block.HashSSZ()
+	require.NoError(t, err)
+	selectedRoot := common.Hash{0xbb}
+	fcu.HeadVal = selectedRoot
+	fcu.HeadSlotVal = block.Block.Slot
+	fcu.StateAtBlockRootVal[selectedRoot] = postState
+	fcu.GetHeadWithAuxiliaryRootFn = func(root common.Hash) (common.Hash, uint64, error) {
+		require.Equal(t, common.Hash(blockRoot), root)
+		return selectedRoot, block.Block.Slot, nil
+	}
+	fcu.OnTickFn = func(uint64) {}
+	copyCalled := false
+	fcu.CopyStateAtBlockRootIntoFn = func(root common.Hash, dst *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+		copyCalled = true
+		require.Equal(t, selectedRoot, root)
+		if dst == nil || dst.BeaconConfig() != postState.BeaconConfig() {
+			return postState.Copy()
+		}
+		return dst, postState.CopyInto(dst)
+	}
+	engine := execution_client.NewMockExecutionEngine(ctrl)
+	engine.EXPECT().ForkChoiceUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+	handler.engine = engine
+	producer := &recordingBlockAttestationProducer{}
+	handler.attestationProducer = producer
+
+	require.NoError(t, handler.storeBlockAndBlobs(t.Context(), block, nil, nil, BlockPublishingValidationConsensus))
+	require.True(t, copyCalled)
+	require.Equal(t, selectedRoot, producer.root)
+	require.NoError(t, syncedData.ViewHeadStateWithIdentity(func(headState *state.CachingBeaconState, root common.Hash, slot uint64) error {
+		require.Same(t, producer.state, headState)
+		require.Equal(t, selectedRoot, root)
+		require.Equal(t, postState.Slot(), slot)
+		return nil
+	}))
+}
+
+func TestStoreBlockAndBlobsReportsAuxiliaryHeadLookupError(t *testing.T) {
+	_, blocks, _, _, _, handler, _, _, fcu, _ := setupTestingHandler(t, clparams.Phase0Version, log.Root(), true)
+	wantErr := errors.New("auxiliary state unavailable")
+	fcu.OnTickFn = func(uint64) {}
+	fcu.GetHeadWithAuxiliaryRootFn = func(common.Hash) (common.Hash, uint64, error) {
+		return common.Hash{}, 0, wantErr
+	}
+
+	err := handler.storeBlockAndBlobs(t.Context(), blocks[1], nil, nil, BlockPublishingValidationConsensus)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestStoreBlockAndBlobsDoesNotPublishMissingSelectedHeadState(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	_, blocks, _, _, _, handler, _, syncedData, fcu, _ := setupTestingHandler(t, clparams.Phase0Version, log.Root(), true)
+	selectedRoot := common.Hash{0xbb}
+	previousRoot := syncedData.HeadRoot()
+	fcu.OnTickFn = func(uint64) {}
+	fcu.GetHeadWithAuxiliaryRootFn = func(common.Hash) (common.Hash, uint64, error) {
+		return selectedRoot, blocks[1].Block.Slot, nil
+	}
+	copyCalled := false
+	fcu.CopyStateAtBlockRootIntoFn = func(root common.Hash, _ *state.CachingBeaconState) (*state.CachingBeaconState, error) {
+		copyCalled = true
+		require.Equal(t, selectedRoot, root)
+		return nil, nil
+	}
+	engine := execution_client.NewMockExecutionEngine(ctrl)
+	engine.EXPECT().ForkChoiceUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+	handler.engine = engine
+
+	err := handler.storeBlockAndBlobs(t.Context(), blocks[1], nil, nil, BlockPublishingValidationConsensus)
+	require.ErrorContains(t, err, "state not found for root")
+	require.True(t, copyCalled)
+	require.Equal(t, previousRoot, syncedData.HeadRoot())
+}
+
+type recordingBlockAttestationProducer struct {
+	attestation_producer.AttestationDataProducer
+	state *state.CachingBeaconState
+	root  common.Hash
+}
+
+func (p *recordingBlockAttestationProducer) ProduceAndCacheAttestationData(_ kv.Tx, st *state.CachingBeaconState, root common.Hash, _ uint64) (solid.AttestationData, error) {
+	p.state = st
+	p.root = root
+	return solid.AttestationData{}, nil
+}
+
 func TestStoreBlockAndBlobsClassifiesKnownRootMismatchAsPermanent(t *testing.T) {
 	_, blocks, _, _, _, handler, _, _, fcu, _ := setupTestingHandler(t, clparams.Phase0Version, log.Root(), true)
 	stored := blocks[1]

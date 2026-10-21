@@ -76,6 +76,7 @@ type chainTipBatchForkGraph struct {
 	added       map[common.Hash]int
 	insertOnAdd bool
 	envReads    map[common.Hash]int
+	currentRoot common.Hash
 }
 
 type chainTipBatchEnvelopeSentinel struct {
@@ -93,17 +94,18 @@ func (*chainTipBatchEnvelopeSentinel) PeersInfo(context.Context, *sentinelproto.
 	return &sentinelproto.PeersInfoResponse{}, nil
 }
 
-func (g *chainTipBatchForkGraph) AddChainSegment(block *cltypes.SignedBeaconBlock, _ bool) (*state2.CachingBeaconState, fork_graph.ChainSegmentInsertionResult, error) {
+func (g *chainTipBatchForkGraph) AddChainSegment(block *cltypes.SignedBeaconBlock, _ bool) (fork_graph.ChainSegmentInsertionResult, error) {
 	root, err := block.Block.HashSSZ()
 	if err != nil {
-		return nil, fork_graph.InvalidBlock, err
+		return fork_graph.InvalidBlock, err
 	}
 	g.added[common.Hash(root)]++
 	if g.insertOnAdd {
 		g.parents[common.Hash(root)] = block
-		return g.parentState, fork_graph.Success, nil
+		g.currentRoot = common.Hash(root)
+		return fork_graph.Success, nil
 	}
-	return nil, fork_graph.PreValidated, nil
+	return fork_graph.PreValidated, nil
 }
 
 func (g *chainTipBatchForkGraph) GetHeader(root common.Hash) (*cltypes.BeaconBlockHeader, bool) {
@@ -120,14 +122,18 @@ func (g *chainTipBatchForkGraph) GetBlock(root common.Hash) (*cltypes.SignedBeac
 	return g.ForkGraph.GetBlock(root)
 }
 
-func (g *chainTipBatchForkGraph) GetState(root common.Hash, alwaysCopy bool) (*state2.CachingBeaconState, error) {
-	if _, ok := g.parents[root]; ok {
-		if alwaysCopy {
-			return g.parentState.Copy()
-		}
-		return g.parentState, nil
+func (g *chainTipBatchForkGraph) CurrentStateLocked(root common.Hash) *state2.CachingBeaconState {
+	if root == g.currentRoot {
+		return g.parentState
 	}
-	return g.ForkGraph.GetState(root, alwaysCopy)
+	return g.ForkGraph.CurrentStateLocked(root)
+}
+
+func (g *chainTipBatchForkGraph) ReplayState(root common.Hash) (*state2.CachingBeaconState, error) {
+	if _, ok := g.parents[root]; ok {
+		return g.parentState.Copy()
+	}
+	return g.ForkGraph.ReplayState(root)
 }
 
 func (g *chainTipBatchForkGraph) GetCurrentJustifiedCheckpoint(root common.Hash) (solid.Checkpoint, bool) {
@@ -660,7 +666,7 @@ func newChainTipBatchEnvelopeRPC(t *testing.T, cfg *clparams.BeaconChainConfig, 
 	var response bytes.Buffer
 	require.NoError(t, ssz_snappy.EncodeAndWrite(&response, envelope, digest[:]...))
 	sentinel := &chainTipBatchEnvelopeSentinel{response: response.Bytes()}
-	return rpc.NewBeaconRpcP2P(t.Context(), sentinel, cfg, clock, nil), sentinel
+	return rpc.NewBeaconRpcP2P(t.Context(), sentinel, cfg, clock), sentinel
 }
 
 func TestChainTipBatchReplayBudgetSkipsParentsWithUsableVerdict(t *testing.T) {
@@ -1334,7 +1340,7 @@ func TestChainTipBatchReportsAParentEnvelopeNoPeerServes(t *testing.T) {
 	require.NoError(t, err)
 	delete(graph.envelopes, parentRoot)
 	clock := eth_clock.NewEthereumClock(0, common.Hash{}, cfg.beaconCfg)
-	cfg.rpc = rpc.NewBeaconRpcP2P(t.Context(), &chainTipBatchEnvelopeSentinel{}, cfg.beaconCfg, clock, nil)
+	cfg.rpc = rpc.NewBeaconRpcP2P(t.Context(), &chainTipBatchEnvelopeSentinel{}, cfg.beaconCfg, clock)
 	cfg.chainTipRejections = newChainTipRejections(time.Hour, nil)
 	cfg.chainTipRejections.lastLog = time.Now()
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
